@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import timedelta
+from hashlib import sha256
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -16,7 +18,10 @@ import time
 from uuid import uuid4
 
 import pytest
+from sose.composition.boundary import BoundaryService
 from sose.composition.model import DeliveryStatus
+from sose.composition.recovery import TradingCustomerRecoveryRunner
+from sose.examples.order_to_cash import simulation as o2c
 from sose.persistence.postgres import PostgresPersistence
 from tests.e2e.sose.persistence.test_postgres_pc6_full_real_domain_recovery import (
     _seed_before_logistics_ack, _proof, _terminal, _tick,
@@ -187,18 +192,107 @@ def _scenario(tmp_path, *, phase, transport):
     return _proof(DSN, domains, physical, seeds)
 
 
-@pytest.mark.parametrize("phase", ("before_commit", "after_commit"))
-def test_real_pc6_atomic_ack_survives_transport_ambiguity(tmp_path, phase):
-    assert DSN
-    snapshot = _scenario(tmp_path, phase=phase, transport="proxy")
-    assert all(len(snapshot["organizations"][org]["certificates"]) == 4
-               for org in ("a", "b"))
+
+def _uninterrupted_reference(phase):
+    """Same durable starting ACK state, but no failed transport or DB service."""
+    domains = {org: f"control_ack_{org}_{uuid4().hex[:12]}" for org in ("a", "b")}
+    physical = f"control_ack_phys_{uuid4().hex[:12]}"
+    seeded = {org: _seed_before_logistics_ack(DSN, ns)
+              for org, ns in domains.items()}
+    seeds = {org: data[:2] for org, data in seeded.items()}
+    assert seeds["a"] == seeds["b"]
+
+    if phase == "after_commit":
+        # An ACK committed outside the recurring worker is the explicit
+        # continuous reference for a client that lost its COMMIT response.
+        with PostgresPersistence(DSN, namespace=domains["a"]) as store:
+            service = BoundaryService(store)
+            lease = service.claim_next(
+                owner_id="continuous-ack", now=o2c.ORIGIN,
+                lease_duration=timedelta(seconds=1),
+                destination_domain="logistics",
+                accepted_contracts=frozenset({("warehouse.dispatch_ready", 1)}),
+            )
+            assert lease is not None
+            with store.boundary_transaction() as uow:
+                message = uow.get_boundary_message(lease.message_id)
+            assert message is not None
+            receipt = service.consume(
+                lease=lease,
+                registry=TradingCustomerRecoveryRunner._registry_for(message),
+                now=o2c.ORIGIN,
+            )
+            assert receipt.consumer_effect_id == seeded["a"][1]
+
+    # Before-COMMIT reference has a still-pending ACK. Both references use
+    # exactly the same observed-time delay as their faulting counterparts.
+    _tick(DSN, domains["b"], physical, "b", seeds["b"][0], 0)
+    for tick in range(26):
+        if _terminal(DSN, domains["a"]):
+            break
+        _tick(DSN, domains["a"], physical, "a", seeds["a"][0], tick,
+              observed_delay=timedelta(seconds=2))
+    assert _terminal(DSN, domains["a"])
+    for tick in range(1, 26):
+        if _terminal(DSN, domains["b"]):
+            break
+        _tick(DSN, domains["b"], physical, "b", seeds["b"][0], tick)
+    assert _terminal(DSN, domains["b"])
+    return _proof(DSN, domains, physical, seeds)
 
 
+def _record_infrastructure_equivalence(transport, phase, reference, recovered):
+    target = os.environ.get("SOSE_PC6_INFRA_CANONICAL_REPORT")
+    if not target:
+        return
+    path = Path(target)
+    report = (
+        json.loads(path.read_text(encoding="utf-8"))
+        if path.exists()
+        else {
+            "protocol": "pc6-postgres-infrastructure-canonical-v1",
+            "oracle": "the complete #451 operational/domain/causal/physical snapshot",
+            "cases": [],
+        }
+    )
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, default=str)
+    case = {
+        "fault": f"{transport}_{phase}",
+        "equivalent": reference == recovered,
+        "reference_truth": json.loads(canonical(reference)),
+        "recovered_truth": json.loads(canonical(recovered)),
+        "reference_sha256": sha256(canonical(reference).encode()).hexdigest(),
+        "recovered_sha256": sha256(canonical(recovered).encode()).hexdigest(),
+        "ack_outcome": "rolled_back" if phase == "before_commit" else "committed",
+    }
+    if any(existing["fault"] == case["fault"] for existing in report["cases"]):
+        raise AssertionError("duplicate infrastructure fault certificate")
+    report["cases"].append(case)
+    report["cases"].sort(key=lambda entry: entry["fault"])
+    report["all_equivalent"] = all(entry["equivalent"] for entry in report["cases"])
+    path.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n",
+                    encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def _canonical_infrastructure_controls():
+    # Reuse only immutable reference truth, never process/session state.
+    return {}
+
+
+@pytest.mark.parametrize("transport", ("proxy", "server"))
 @pytest.mark.parametrize("phase", ("before_commit", "after_commit"))
-def test_real_pc6_atomic_ack_survives_postgres_restart(tmp_path, phase):
-    if not CONTAINER_ID:
+def test_real_pc6_atomic_ack_infrastructure_failure_preserves_full_canonical_truth(
+    tmp_path, phase, transport, _canonical_infrastructure_controls,
+):
+    if transport == "server" and not CONTAINER_ID:
         pytest.skip("real PostgreSQL container control is mandatory for server restart")
-    snapshot = _scenario(tmp_path, phase=phase, transport="server")
-    assert all(len(snapshot["organizations"][org]["certificates"]) == 4
-               for org in ("a", "b"))
+    if phase not in _canonical_infrastructure_controls:
+        _canonical_infrastructure_controls[phase] = _uninterrupted_reference(phase)
+    baseline = _canonical_infrastructure_controls[phase]
+    recovered = _scenario(tmp_path, phase=phase, transport=transport)
+    assert recovered == baseline, (transport, phase)
+    _record_infrastructure_equivalence(
+        transport, phase, baseline, recovered,
+    )
