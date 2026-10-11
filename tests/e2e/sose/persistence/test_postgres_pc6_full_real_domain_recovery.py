@@ -24,7 +24,6 @@ from sose.composition.audit import audit_causal_history
 from sose.composition.bindings import SettlementBindingService
 from sose.composition.recovery import TradingCustomerRecoveryRunner
 from sose.composition.scheduler import RecoverySchedule
-from sose.composition.effects import BusinessEffectService
 from sose.core.resource_identity import ResourcePoolContract
 from sose.core.resource_reservations import authoritative_effect_reservation_id
 from sose.examples.order_to_cash import simulation as o2c
