@@ -508,6 +508,7 @@ jobs:
       SOSE_PC6_REAL_STATECHART_REPORT: pc6-real-statechart-equivalence.json
       SOSE_PC6_FEDERATED_REPORT: pc6-federated-recovery.json
       SOSE_PC6_FEDERATED_FAULT_MATRIX_REPORT: pc6-federated-fault-matrix.json
+      SOSE_PC6_MULTIDOMAIN_OSKILL_REPORT: pc6-multidomain-oskill.json
 
     steps:
       - name: Checkout
@@ -543,6 +544,15 @@ jobs:
             tests/e2e/sose/persistence/test_postgres_pc6_authoritative_pickup.py \
             tests/e2e/sose/persistence/test_postgres_resource_release_race.py \
             tests/e2e/sose/persistence/test_postgres_pc6_federated_recovery.py
+      - name: Upload PC6 real OS-kill multidomain boundary matrix
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pc6-multidomain-boundary-oskill
+          path: pc6-multidomain-oskill.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload PC6 federated multi-window OS-kill equivalence
         if: always()
         uses: actions/upload-artifact@v7
