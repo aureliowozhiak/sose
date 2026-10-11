@@ -53,6 +53,10 @@ class SimulationJobState:
     completed_batch_triggers: tuple[CompletedJobTrigger, ...] = ()
     phase: str = "idle"
     last_error: str | None = None
+    # Immutable effect IDs admitted to the currently active recovery trigger.
+    # Their business certificates debit this occurrence after process death.
+    # Physically mapped effects use authoritative resource-ledger enrollment.
+    active_effect_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.job_id:
@@ -79,6 +83,12 @@ class SimulationJobState:
             self.last_completed_batch_ticks,
             label="last_completed_batch_ticks",
         )
+        if (
+            any(not isinstance(effect_id, str) or not effect_id
+                for effect_id in self.active_effect_ids)
+            or len(self.active_effect_ids) != len(set(self.active_effect_ids))
+        ):
+            raise ValueError("active recovery effects require unique nonempty identities")
         if self.status not in {"ready", "running", "paused", "failed"}:
             raise ValueError(f"unsupported job status: {self.status}")
         if self.phase not in {"idle", "advance", "reconcile"}:
