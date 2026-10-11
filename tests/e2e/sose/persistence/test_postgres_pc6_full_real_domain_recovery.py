@@ -77,14 +77,19 @@ def _seed_real_workflow(dsn, ns):
         with patch.object(customer, "_execute_intent", side_effect=only_seed):
             with pytest.raises(RuntimeError, match="pc6 staged real Logistics boundary"):
                 customer.run_customer_demand_path(persistence=store, instance_key=INSTANCE)
-        pending = [
-            c for c in store.commands()
-            if c.name == DOMAINS[0]
-        ]
-        assert len(pending) == 1
-        effect = pending[0]
+        with store.boundary_transaction() as uow:
+            dispatches = [
+                (uow.get_boundary_message(d.message_id),
+                 uow.get_boundary_consumption(d.delivery_id))
+                for d in uow.boundary_deliveries()
+                if d.contract_name == "warehouse.dispatch_ready"
+            ]
+        assert len(dispatches) == 1
+        dispatch, receipt = dispatches[0]
+        assert dispatch is not None and receipt is not None
+        effect = store.command(receipt.consumer_effect_id)
+        assert effect is not None and effect.name == DOMAINS[0]
         assert store.entity("shipment", effect.entity_id).state == "created"
-        assert any(m.contract_key == CONTRACTS[0] for m in store.boundary_messages())
         return effect.correlation_id, effect.command_id
 
 
