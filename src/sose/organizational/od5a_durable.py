@@ -15,6 +15,7 @@ import json
 from typing import Any
 
 from sose.core.events import DomainEvent
+from sose.core.identity import deterministic_id
 from sose.core.runtime import ResourceDefinition, ResourceReservation
 from sose.domain.entity import Entity
 from sose.persistence.base import Persistence
@@ -32,11 +33,11 @@ def _time(offset: float) -> datetime:
 
 
 def _key(item_id: str, station: str) -> str:
-    return f"{item_id}:{station}"
+    return deterministic_id("od5a-durable-stage", item_id, station)
 
 
 def _event_id(job_id: str, kind: str, item_id: str, source: str = "", target: str = "") -> str:
-    return f"od5a:{job_id}:{item_id}:{kind}:{source}:{target}"
+    return deterministic_id("od5a-durable-event", job_id, kind, item_id, source, target)
 
 
 def _canonical_hash(payload: object) -> str:
@@ -94,8 +95,11 @@ def _grant(
     if state["resources"][resource] not in (None, ""):
         raise RuntimeError("conflicting authoritative physical reservation")
     resource_name = f"{job_id}/{resource}"
-    request_id = f"od5a:{job_id}:{kind}:{request['item']}:{request['source']}:{request['target']}"
-    reservation_id = f"{request_id}:reservation"
+    request_id = deterministic_id(
+        "od5a-durable-request", job_id, kind, request["item"],
+        request["source"], request["target"],
+    )
+    reservation_id = deterministic_id("od5a-durable-reservation", request_id)
     if uow.get_resource_reservation(reservation_id) is not None:
         raise RuntimeError(f"duplicate durable reservation for {request_id}")
     duration = (
