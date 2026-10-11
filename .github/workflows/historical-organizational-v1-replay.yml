@@ -11,6 +11,8 @@ on:
       - "docs/organizational/preregistration/**"
       - ".github/workflows/historical-organizational-v1-replay.yml"
       - ".github/organizational-v1-published-digests.json"
+      - "docs/architecture/decisions/adr-0007-versioned-scientific-freezes.md"
+      - "tests/unit/sose/organizational/test_historical_replay_governance.py"
   push:
     branches: [main]
     paths:
@@ -22,6 +24,8 @@ on:
       - "docs/organizational/preregistration/**"
       - ".github/workflows/historical-organizational-v1-replay.yml"
       - ".github/organizational-v1-published-digests.json"
+      - "docs/architecture/decisions/adr-0007-versioned-scientific-freezes.md"
+      - "tests/unit/sose/organizational/test_historical_replay_governance.py"
   workflow_dispatch:
 
 permissions:
@@ -65,6 +69,12 @@ jobs:
       - name: Install frozen historical environment
         working-directory: historical-source
         run: uv sync --frozen --extra dev
+
+      - name: Verify immutable historical freeze governance
+        working-directory: historical-source
+        run: |
+          uv run --frozen python ../gate-source/scripts/verify_organizational_v1_replay_contract.py \
+            --root ../gate-source --output ../v1-freeze-governance.json
 
       - name: Verify checkout identity
         working-directory: historical-source
@@ -139,5 +149,6 @@ jobs:
           path: |
             historical-source/historical-replay-${{ matrix.domain }}/
             historical-source/historical-replay-${{ matrix.domain }}.staging/
+            v1-freeze-governance.json
           retention-days: 30
           if-no-files-found: warn
