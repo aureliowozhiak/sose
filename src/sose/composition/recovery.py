@@ -340,6 +340,25 @@ class TradingCustomerRecoveryRunner:
                     if not admitted:
                         deferred_this_tick.add(effect_id)
                         continue
+                # Every non-physical business action is durably enrolled in
+                # the owning trigger BEFORE the real domain transition. On
+                # restart its immutable certificate consumes the same slot.
+                # Resource-mapped actions already have an authoritative
+                # admission-to-trigger link in the physical PostgreSQL ledger.
+                if (
+                    active_trigger is not None
+                    and (self.resource_policies is None
+                         or command.name not in self.resource_policies)
+                ):
+                    with store.transaction() as uow:
+                        job = uow.get_job_state(self.job_id)
+                        if job is None or job.active_trigger_id != active_trigger:
+                            raise RuntimeError("recovery effect lost its active trigger")
+                        if effect_id not in job.active_effect_ids:
+                            uow.save_job_state(replace(
+                                job,
+                                active_effect_ids=(*job.active_effect_ids, effect_id),
+                            ))
                 pickup = (
                     resource_intents.booking_for(effect_id, command.name)
                     if resource_intents is not None
@@ -523,6 +542,10 @@ class TradingCustomerRecoveryRunner:
                 return RecoveryTriggerResult(self.job_id, trigger_id, 0)
             if now < current.logical_time:
                 raise ValueError("composition trigger cannot rewind durable logical time")
+            if current.active_trigger_id not in (None, trigger_id):
+                raise RuntimeError("another recovery occurrence is still active")
+            if current.active_trigger_id is None and current.active_effect_ids:
+                raise RuntimeError("completed recovery job has orphaned effect enrollment")
             uow.save_job_state(replace(
                 current,
                 status="running",
@@ -557,6 +580,7 @@ class TradingCustomerRecoveryRunner:
                 status="ready",
                 phase="idle",
                 active_trigger_id=None,
+                active_effect_ids=(),
                 last_completed_trigger_id=trigger_id,
                 completed_batch_triggers=(
                     *current.completed_batch_triggers, completed_record,
