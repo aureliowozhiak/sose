@@ -89,7 +89,8 @@ def verify_manifests(root: Path) -> None:
 def verify_workflow(root: Path, registry: dict) -> None:
     workflow = yaml.load((root / WORKFLOW_PATH).read_text(), Loader=yaml.BaseLoader)
     watched = {"src/sose/**", "scripts/**", "uv.lock", ADR_PATH,
-               CHECKER_PATH, str(WORKFLOW_PATH), str(PUBLISHED_PATH)}
+               "tests/unit/sose/organizational/test_historical_replay_governance.py",
+               str(WORKFLOW_PATH), str(PUBLISHED_PATH)}
     for event in ("push", "pull_request"):
         if not watched <= set(workflow["on"][event]["paths"]):
             raise ValueError("v1 replay is not triggered by governance edits")
