@@ -263,6 +263,24 @@ class TradingCustomerRecoveryRunner:
                 # ACK+Command is one transaction, but is a separate bounded
                 # scheduling action from executing that Command. A worker
                 # killed after ACK must not apply the domain in the same slot.
+                for message_id in current_job.active_publication_message_ids:
+                    message = uow.get_boundary_message(message_id)
+                    deliveries = tuple(
+                        d for d in uow.boundary_deliveries()
+                        if d.message_id == message_id
+                    )
+                    if message is None or len(deliveries) != 1:
+                        raise RuntimeError(
+                            "enrolled recovery publication lacks durable message/delivery"
+                        )
+                    if (
+                        deliveries[0].contract_name != message.contract_name
+                        or deliveries[0].contract_version != message.contract_version
+                    ):
+                        raise RuntimeError(
+                            "enrolled recovery publication contradicts delivery contract"
+                        )
+                    actions += 1
                 for message_id in current_job.active_boundary_message_ids:
                     matches = tuple(
                         delivery for delivery in uow.boundary_deliveries()
@@ -430,6 +448,7 @@ class TradingCustomerRecoveryRunner:
                 }
             reconstructed = customer.reconcile_shipped_fulfillment_egress(
                 store, max_new_messages=self.max_actions - actions,
+                recovery_job_id=self.job_id if active_trigger is not None else None,
             )
             emitted = sum(message.message_id not in before_ids for message in reconstructed)
             if emitted:
@@ -444,6 +463,7 @@ class TradingCustomerRecoveryRunner:
                 }
             reconstructed_logistics = customer.reconcile_completed_logistics_egress(
                 store, max_new_messages=self.max_actions - actions,
+                recovery_job_id=self.job_id if active_trigger is not None else None,
             )
             emitted_logistics = sum(
                 message.message_id not in intermediate_ids
@@ -459,6 +479,7 @@ class TradingCustomerRecoveryRunner:
                 }
             reconstructed_o2c = customer.reconcile_invoiced_o2c_egress(
                 store, max_new_messages=self.max_actions - actions,
+                recovery_job_id=self.job_id if active_trigger is not None else None,
             )
             emitted_o2c = sum(
                 message.message_id not in o2c_before_ids
@@ -474,6 +495,7 @@ class TradingCustomerRecoveryRunner:
                 }
             reconstructed_payment = customer.reconcile_settled_payment_egress(
                 store, max_new_messages=self.max_actions - actions,
+                recovery_job_id=self.job_id if active_trigger is not None else None,
             )
             emitted_payment = sum(
                 message.message_id not in payment_before_ids
@@ -597,6 +619,7 @@ class TradingCustomerRecoveryRunner:
                 raise RuntimeError("another recovery occurrence is still active")
             if current.active_trigger_id is None and (
                 current.active_effect_ids or current.active_boundary_message_ids
+                or current.active_publication_message_ids
             ):
                 raise RuntimeError("completed recovery job has orphaned work enrollment")
             uow.save_job_state(replace(
@@ -635,6 +658,7 @@ class TradingCustomerRecoveryRunner:
                 active_trigger_id=None,
                 active_effect_ids=(),
                 active_boundary_message_ids=(),
+                active_publication_message_ids=(),
                 last_completed_trigger_id=trigger_id,
                 completed_batch_triggers=(
                     *current.completed_batch_triggers, completed_record,
