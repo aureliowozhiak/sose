@@ -881,7 +881,7 @@ raise AssertionError("downstream OS-kill hook was not reached")
 
 
 def _run_later_boundary_cut(dsn, *, destination, contract, predecessor_type,
-                            publisher, cut=None):
+                            publisher, cut, killed=False):
     """Each cut has its own uninterrupted baseline and full canonical oracle."""
     from sose.composition.model import DeliveryStatus
 
@@ -890,12 +890,11 @@ def _run_later_boundary_cut(dsn, *, destination, contract, predecessor_type,
     seeded = {org: _seed_before_logistics_ack(dsn, ns) for org, ns in domains.items()}
     seeds = {org: values[:2] for org, values in seeded.items()}
     assert seeds["a"] == seeds["b"]
-    stage = cut or "after_claim"
     slot = _prepare_downstream_cut(
         dsn, domains["a"], physical_ns, "a", seeds["a"][0],
-        contract=contract, predecessor_type=predecessor_type, cut=stage,
+        contract=contract, predecessor_type=predecessor_type, cut=cut,
     )
-    if cut is None:
+    if not killed:
         _tick(
             dsn, domains["a"], physical_ns, "a", seeds["a"][0], slot,
             observed_delay=timedelta(seconds=2),
@@ -926,7 +925,7 @@ def _run_later_boundary_cut(dsn, *, destination, contract, predecessor_type,
 
     # B progresses on its independent writer epoch while A is genuinely dead.
     _tick(dsn, domains["b"], physical_ns, "b", seeds["b"][0], 0)
-    if cut is not None:
+    if killed:
         with PostgresPersistence(dsn, namespace=domains["a"]) as domain:
             with PostgresPersistence(dsn, namespace=physical_ns) as physical:
                 replay = _schedule(
@@ -959,8 +958,8 @@ def test_pg_real_downstream_boundary_oskill_preserves_canonical_recovery(
         destination=destination, contract=contract,
         predecessor_type=predecessor_type, publisher=publisher,
     )
-    baseline = _run_later_boundary_cut(DSN, **options)
-    recovered = _run_later_boundary_cut(DSN, **options, cut=cut)
+    baseline = _run_later_boundary_cut(DSN, **options, cut=cut)
+    recovered = _run_later_boundary_cut(DSN, **options, cut=cut, killed=True)
     assert recovered == baseline, (destination, cut)
     _record_equivalence(
         f"real_{destination}_{cut}", baseline, recovered,
