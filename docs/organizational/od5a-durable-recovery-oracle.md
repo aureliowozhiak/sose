@@ -42,3 +42,6 @@ The canonical `Entity` clock is scoped to `job_id`; this avoids inventing an unn
 The implementation additionally requires equality of the small deterministic operational trace (physical instance, start/end, dependency source/target and action kind) against the independent ephemeral SimPy pilot for **all five** registered arms. Merely replaying the same persistent reducer twice would be insufficient evidence of mechanism equivalence.
 
 Separate real OS worker-kill tests target both sides of the transaction boundary: death after a durable event is committed but before acknowledgment, and death **inside the SQLite UnitOfWork** immediately after appending an event but before commit. The latter must roll back every uncommitted causal and resource effect. Two job IDs sharing one SQLite database must advance independently without cross-job reservations.
+
+
+As with the datetime-backed SimPy pilot, this reference reducer rejects nonrepresentable sub-microsecond configured arrivals, service intervals, coordination latency and intervention downtime at admission. It cannot silently round a durable resource acquisition/completion into a different causal interval. Exact quantization of generated stochastic durations remains a **future execution-freeze decision**, not a post-outcome adjustment.
