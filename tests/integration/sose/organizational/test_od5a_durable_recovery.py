@@ -239,3 +239,40 @@ def test_two_job_scoped_organizations_advance_without_cross_job_reservations(tmp
         assert not store.resource_reservations()
         assert {e.correlation_id for e in store.events()
                 if e.name.startswith("od5a.")} == {"org-A", "org-B"}
+
+
+def _die_before_semantic_commit(path: str):
+    """Force OS death inside an open UoW, after event append but before COMMIT."""
+    import os
+    import sose.organizational.od5a_durable as durable
+
+    original_emit = durable._emit
+
+    def kill_after_append(*args, **kwargs):
+        original_emit(*args, **kwargs)
+        os._exit(98)
+
+    durable._emit = kill_after_append
+    with SQLitePersistence(path) as store:
+        advance_od5a_durable(store, job_id="od5a-test")
+
+
+def test_real_worker_death_before_commit_rolls_back_entire_semantic_action(tmp_path):
+    path = tmp_path / "before_commit.db"
+    before = _finish(path, "baseline", stop_after=2)
+    child = get_context("spawn").Process(target=_die_before_semantic_commit, args=(str(path),))
+    child.start()
+    child.join(timeout=20)
+    if child.is_alive():
+        child.kill()
+        child.join()
+        pytest.fail("worker did not exit during uncommitted event append")
+    assert child.exitcode == 98
+    with SQLitePersistence(path) as store:
+        after = (
+            od5a_durable_state(store, job_id="od5a-test"),
+            od5a_durable_events(store, job_id="od5a-test"),
+            store.resource_reservations(),
+        )
+    assert after == before
+    assert _finish(path, "baseline") == _finish(tmp_path / "continuous.db", "baseline")
