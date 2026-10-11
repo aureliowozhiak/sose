@@ -328,3 +328,22 @@ def test_fractional_exact_microseconds_match_simpy_after_addition(tmp_path, arm_
             == ticks.to_integral_value()
             for e in events
         )
+
+
+def test_large_logical_clock_fails_closed_on_float_second_precision_loss(tmp_path):
+    """A huge clock plus one microsecond cannot silently become two."""
+    arm = _arms()["baseline"]
+    work = (
+        OD5aWorkItem(
+            item_id="far-future", arrival_at=float(2**33),
+            service_by_station=(("a", 0.000001), ("b", 1.0), ("c", 1.0)),
+        ),
+    )
+    with SQLitePersistence(tmp_path / "huge.db") as store:
+        initialize_od5a_durable(store, job_id="huge", arm=arm, items=work)
+        prior = od5a_durable_state(store, job_id="huge")
+        with pytest.raises(ValueError, match="round-trip|lossless"):
+            advance_od5a_durable(store, job_id="huge")
+        assert od5a_durable_state(store, job_id="huge") == prior
+        assert not od5a_durable_events(store, job_id="huge")
+        assert not store.resource_reservations()
