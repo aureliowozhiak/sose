@@ -274,3 +274,14 @@ def test_real_worker_death_before_commit_rolls_back_entire_semantic_action(tmp_p
         )
     assert after == before
     assert _finish(path, "baseline") == _finish(tmp_path / "continuous.db", "baseline")
+
+
+def test_durable_rejects_coordination_below_datetime_resolution(tmp_path):
+    baseline = _arms()["baseline"]
+    payload = baseline.model.canonical_payload()
+    payload["parameters"]["coordination_latency"] = 0.0000001
+    invalid = OD5aCompiledArm("baseline", ModelSpec.model_validate(payload), None, None)
+    with SQLitePersistence(tmp_path / "precision.db") as store:
+        with pytest.raises(ValueError, match="microsecond"):
+            initialize_od5a_durable(store, job_id="precision", arm=invalid, items=_items())
+        assert store.entity("od5a_durable_pilot", "precision") is None
