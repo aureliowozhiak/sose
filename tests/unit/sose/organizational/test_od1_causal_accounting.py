@@ -128,6 +128,30 @@ def test_actor_epoch_overlap_or_regression_fails_closed():
         ))
 
 
+def test_nested_fractional_actor_epochs_reject_nonadjacent_conflict():
+    # The long-lived reservation overlaps a later epoch even though the
+    # neighboring short-lived interval ends before that epoch begins.
+    with pytest.raises(ValidationError, match="conflicting config epochs"):
+        ActorLedger(actor_id="worker", fractional_multitasking=True, intervals=(
+            ActorLedgerInterval(start=0, end=10, category=ActorCategory.EXECUTION,
+                                allocation=.25, config_epoch=0, model_spec_hash="m0"),
+            ActorLedgerInterval(start=1, end=2, category=ActorCategory.DEVELOPMENT,
+                                allocation=.25, config_epoch=0, model_spec_hash="m0"),
+            ActorLedgerInterval(start=3, end=4, category=ActorCategory.COORDINATION,
+                                allocation=.25, config_epoch=1, model_spec_hash="m1"),
+        ))
+
+
+def test_reused_actor_epoch_requires_one_unambiguous_model_hash():
+    with pytest.raises(ValidationError, match="same actor config_epoch"):
+        ActorLedger(actor_id="worker", intervals=(
+            ActorLedgerInterval(start=0, end=1, category=ActorCategory.DEVELOPMENT,
+                                config_epoch=0, model_spec_hash="m0"),
+            ActorLedgerInterval(start=1, end=2, category=ActorCategory.EXECUTION,
+                                config_epoch=0, model_spec_hash="different"),
+        ))
+
+
 def test_invalid_config_epoch_and_anonymous_version_fail():
     with pytest.raises(ValidationError, match="nonnegative integer"):
         _event("bad", ItemCategory.PROCESSING, 0, 1, "source", -1)
