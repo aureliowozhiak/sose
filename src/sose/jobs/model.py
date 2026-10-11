@@ -60,6 +60,9 @@ class SimulationJobState:
     # Durable ingress receipts charged to the owning unfinished recurrence.
     # A completed ACK is work even if its domain Command remains pending.
     active_boundary_message_ids: tuple[str, ...] = ()
+    # Outbound messages published by this unfinished recurring occurrence.
+    # Enrolled atomically with the immutable publication, not afterward.
+    active_publication_message_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.job_id:
@@ -100,6 +103,14 @@ class SimulationJobState:
             )
         ):
             raise ValueError("active recovery boundary messages require unique nonempty identities")
+        if (
+            any(not isinstance(message_id, str) or not message_id
+                for message_id in self.active_publication_message_ids)
+            or len(self.active_publication_message_ids) != len(
+                set(self.active_publication_message_ids)
+            )
+        ):
+            raise ValueError("active recovery publications require unique nonempty identities")
         if self.status not in {"ready", "running", "paused", "failed"}:
             raise ValueError(f"unsupported job status: {self.status}")
         if self.phase not in {"idle", "advance", "reconcile"}:
