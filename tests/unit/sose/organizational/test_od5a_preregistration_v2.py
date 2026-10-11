@@ -48,9 +48,13 @@ def test_od5a_prospective_regimes_do_not_depend_on_post_treatment_outcomes() -> 
 
 def test_od5a_cannot_be_accepted_as_execution_freeze_with_missing_commitments() -> None:
     plan = _design()
-    assert plan["allocation"]["design"] == "sobol"
-    assert plan["allocation"]["n_worlds"] == 64
+    assert plan["allocation"]["design"] == "sobol_nonload_strata_crossed_with_fixed_load_grid"
+    assert plan["allocation"]["n_sobol_nonload_strata"] == 32
+    assert plan["allocation"]["rho_nominal_grid"] == [0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6]
+    assert plan["allocation"]["n_configured_worlds"] == 32 * 7
     assert plan["allocation"]["replications_per_world_arm"] == 16
+    assert plan["allocation"]["n_arm_world_replications"] == 32 * 7 * 16 * 5
+    assert plan["allocation"]["exogenous_stratum_rule"].startswith("hold every non-load")
     for key in ("root_seed", "bounds", "fixed_horizon"):
         assert plan["allocation"][key] == "UNSET_AT_EXECUTION_FREEZE"
     assert len(plan["execution_freeze_prerequisites"]) >= 8
