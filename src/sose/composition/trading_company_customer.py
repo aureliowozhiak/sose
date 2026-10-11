@@ -665,6 +665,13 @@ def _execute_intent(
                 if not logistics.reconcile_origin_hub(
                     persistence, engine, backend, entities=fixtures.logistics,
                 ):
+                    request_id = f"origin-dock:{shipment_id}"
+                    if engine.resources.has_request(request_id):
+                        # Another organization's finite dock occupancy or a
+                        # pending durable hub-queue put is backpressure, not
+                        # a failed shipment. Keep its original Command and
+                        # resume against the persisted request on retry.
+                        raise DurableResourceWait("origin_dock", request_id)
                     raise RuntimeError("logistics origin-hub handling failed")
 
             if current_state() in {"at_origin_hub", "in_transfer"}:
