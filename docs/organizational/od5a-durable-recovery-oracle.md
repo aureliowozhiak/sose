@@ -45,3 +45,8 @@ Separate real OS worker-kill tests target both sides of the transaction boundary
 
 
 As with the datetime-backed SimPy pilot, this reference reducer rejects nonrepresentable sub-microsecond configured arrivals, service intervals, coordination latency and intervention downtime at admission. It cannot silently round a durable resource acquisition/completion into a different causal interval. Exact quantization of generated stochastic durations remains a **future execution-freeze decision**, not a post-outcome adjustment.
+
+
+## Review hardening: cumulative time arithmetic
+
+Input durations alone being microsecond-aligned is insufficient: IEEE-754 addition can yield `0.1 + 0.2 = 0.30000000000000004` and create a false causal ordering difference between the durable reducer and the datetime-normalizing SimPy backend. The durable action completion scheduler now converts both terms to integral microseconds, adds integers and only then converts the normalized absolute offset to seconds. Loss of representability above `2**53` microsecond ticks fails closed. A five-arm fractional service/arrival differential regression compares full physical traces against the independent SimPy pilot.
