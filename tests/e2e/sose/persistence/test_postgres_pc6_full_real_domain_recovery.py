@@ -24,6 +24,7 @@ from sose.composition.audit import audit_causal_history
 from sose.composition.bindings import SettlementBindingService
 from sose.composition.recovery import TradingCustomerRecoveryRunner
 from sose.composition.scheduler import RecoverySchedule
+from sose.composition.effects import BusinessEffectService
 from sose.core.resource_identity import ResourcePoolContract
 from sose.core.resource_reservations import authoritative_effect_reservation_id
 from sose.examples.order_to_cash import simulation as o2c
@@ -280,6 +281,28 @@ def killed(store, source, effect_id, *, authoritative_pickup=None, resource_pers
         assert any(c.effect_id == effect_id for c in store.business_effects())
         os._exit(79)
 TradingCustomerRecoveryRunner._execute_pending = staticmethod(killed)
+original_complete = BusinessEffectService.complete
+terminal_by_name = {
+    "composition.deliver_shipment": "delivered",
+    "composition.complete_external_fulfillment": "invoiced",
+    "composition.settle_customer_payment": "settled",
+    "composition.post_customer_journal": "posted",
+}
+cut_for_name = {
+    "before_logistics_certificate": "composition.deliver_shipment",
+    "before_o2c_certificate": "composition.complete_external_fulfillment",
+    "before_payments_certificate": "composition.settle_customer_payment",
+    "before_r2r_certificate": "composition.post_customer_journal",
+}
+def death_before_certificate(self, *, effect_id, completed_at):
+    command = self.persistence.command(effect_id)
+    if command is not None and command.name == cut_for_name.get(cut):
+        terminal = self.persistence.entity(command.entity_type, command.entity_id)
+        assert terminal is not None and terminal.state == terminal_by_name[command.name]
+        assert not any(c.effect_id == effect_id for c in self.persistence.business_effects())
+        os._exit(79)
+    return original_complete(self, effect_id=effect_id, completed_at=completed_at)
+BusinessEffectService.complete = death_before_certificate
 with PostgresPersistence(dsn, namespace=domain_ns) as domain:
     with PostgresPersistence(dsn, namespace=physical_ns) as physical:
         runner = TradingCustomerRecoveryRunner(
@@ -343,7 +366,7 @@ def _pending_domain_effect(dsn, ns, intent_name):
     return False
 
 
-def _run_real_domain_cut(dsn, *, name, killed):
+def _run_real_domain_cut(dsn, *, name, killed, before_certificate=False):
     domains = {"a": _name("pc6cut_a"), "b": _name("pc6cut_b")}
     shared_ns = _name("pc6cut_physical")
     seeds = {org: _seed_real_workflow(dsn, ns) for org, ns in domains.items()}
@@ -354,12 +377,19 @@ def _run_real_domain_cut(dsn, *, name, killed):
         slot += 1
     assert not _terminal(dsn, domains["a"])
     if killed:
-        cut = {
-            DOMAINS[0]: "after_logistics_effect",
-            DOMAINS[1]: "after_o2c_effect",
-            DOMAINS[2]: "after_payments_effect",
-            DOMAINS[3]: "after_r2r_effect",
-        }[name]
+        cut = (
+            {
+                DOMAINS[0]: "before_logistics_certificate",
+                DOMAINS[1]: "before_o2c_certificate",
+                DOMAINS[2]: "before_payments_certificate",
+                DOMAINS[3]: "before_r2r_certificate",
+            } if before_certificate else {
+                DOMAINS[0]: "after_logistics_effect",
+                DOMAINS[1]: "after_o2c_effect",
+                DOMAINS[2]: "after_payments_effect",
+                DOMAINS[3]: "after_r2r_effect",
+            }
+        )[name]
         child = subprocess.run(
             [sys.executable, "-c", _KILL_PROCESS, dsn, domains["a"],
              shared_ns, seeds["a"][0], cut, str(slot)],
@@ -368,10 +398,16 @@ def _run_real_domain_cut(dsn, *, name, killed):
         assert child.returncode == 79, (name, child.stderr[-1800:])
         with PostgresPersistence(dsn, namespace=domains["a"]) as dead:
             assert dead.job_state("real-pc6-a").active_trigger_id is not None
-            assert any(c.entity_type == {
+            entity_type = {
                 DOMAINS[0]: "shipment", DOMAINS[1]: "sales_order",
                 DOMAINS[2]: "card_payment", DOMAINS[3]: "journal_entry",
-            }[name] for c in dead.business_effects())
+            }[name]
+            certified = any(
+                c.entity_type == entity_type for c in dead.business_effects()
+            )
+            assert certified is not before_certificate
+            if before_certificate:
+                assert _pending_domain_effect(dsn, domains["a"], name)
     else:
         _tick(dsn, domains["a"], shared_ns, "a", seeds["a"][0], slot)
 
@@ -402,3 +438,14 @@ def test_pg_real_nonphysical_domain_certification_after_os_kill_preserves_slot(i
     baseline = _run_real_domain_cut(DSN, name=intent_name, killed=False)
     recovered = _run_real_domain_cut(DSN, name=intent_name, killed=True)
     assert recovered == baseline
+
+
+@pytest.mark.parametrize("intent_name", DOMAINS)
+def test_pg_real_statechart_commits_but_worker_dies_before_business_certificate(intent_name):
+    """Actual durable domain event survives death without an invented certificate."""
+    assert DSN is not None
+    baseline = _run_real_domain_cut(DSN, name=intent_name, killed=False)
+    resumed = _run_real_domain_cut(
+        DSN, name=intent_name, killed=True, before_certificate=True,
+    )
+    assert resumed == baseline
