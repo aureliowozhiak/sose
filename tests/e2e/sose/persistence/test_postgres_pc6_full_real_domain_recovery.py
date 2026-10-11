@@ -186,6 +186,20 @@ def _proof(dsn, domains, physical_ns, seeds):
                 messages = tuple(
                     uow.get_boundary_message(d.message_id) for d in deliveries
                 )
+            by_message_id = {m.message_id: m for m in messages if m is not None}
+            assert len(by_message_id) == len(messages), "duplicate boundary message identity"
+            causal_edges = tuple(sorted(
+                (m.causation_id, m.message_id)
+                for m in messages if m is not None
+                and m.causation_id in by_message_id
+            ))
+            assert len(causal_edges) == len(messages) - 1, (
+                "real Trading Company boundary lineage is incomplete", causal_edges,
+            )
+            for parent_id, child_id in causal_edges:
+                parent, child = by_message_id[parent_id], by_message_id[child_id]
+                assert parent.correlation_id == child.correlation_id
+                assert parent.produced_at <= child.produced_at
             binding = SettlementBindingService(view).for_order(
                 next(c.entity_id for c in certs if c.entity_type == "sales_order")
             )
@@ -195,6 +209,7 @@ def _proof(dsn, domains, physical_ns, seeds):
             evidence[org] = {
                 "semantic_digest": audit.semantic_digest,
                 "typed_edges": audit.typed_edges,
+                "boundary_causal_edges": causal_edges,
                 "messages": _canonical_objects(messages),
                 "ack_receipts": relevant,
                 "entities": _canonical_objects(store.entities()),
