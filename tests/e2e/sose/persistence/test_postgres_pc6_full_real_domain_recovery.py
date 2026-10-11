@@ -680,3 +680,50 @@ def test_pg_real_logistics_boundary_worker_death_preserves_recurring_slot(cut):
     recovered = _run_real_boundary_cut(DSN, cut=cut)
     assert recovered == baseline, f"recurring slot advanced incorrectly after {cut}"
     _record_equivalence(f"real_logistics_{cut}", baseline, recovered)
+
+
+def test_pc6_bundle_publishes_full_canonical_continuous_and_recovered_truth(
+    tmp_path, monkeypatch,
+):
+    """SHA-only evidence cannot be independently inspected or scientifically audited."""
+    path = tmp_path / "truth.json"
+    monkeypatch.setenv("SOSE_PC6_REAL_MULTIDOMAIN_REPORT", str(path))
+    truth = {
+        "organizations": {
+            org: {
+                "messages": [f"message-{org}"],
+                "ack_receipts": [[f"message-{org}", "consumed", f"effect-{org}", f"receipt-{org}"]],
+                "events": [f"event-{org}"],
+                "certificates": [f"certificate-{org}"],
+                "entities": [f"entity-{org}"],
+                "typed_edges": [["message-root", f"message-{org}"]],
+                "position": {"tick": 1, "logical_time": "2026-10-11T00:00:00Z"},
+                "job_state": {"next_tick": 2, "active_trigger_id": None},
+                "scheduled": [],
+                "resources": [],
+                "stores": [],
+                "containers": [],
+                "sinks": [],
+            }
+            for org in ("a", "b")
+        },
+        "physical": {
+            "reservations": ["finite-physical-courier"],
+            "events": ["released-courier"],
+        },
+    }
+    _record_equivalence("auditable-truth", truth, truth)
+    report = json.loads(path.read_text(encoding="utf-8"))
+    case, = report["cases"]
+    assert case["equivalent"] is True
+    assert case["reference_truth"] == truth
+    assert case["recovered_truth"] == truth
+    assert case["reference_sha256"] == sha256(
+        json.dumps(case["reference_truth"], sort_keys=True).encode()
+    ).hexdigest()
+    assert case["recovered_sha256"] == sha256(
+        json.dumps(case["recovered_truth"], sort_keys=True).encode()
+    ).hexdigest()
+    assert case["reference_truth"]["physical"]["reservations"] == [
+        "finite-physical-courier"
+    ]
