@@ -108,7 +108,7 @@ def _schedule(domain, shared, *, organization, correlation, max_actions=1):
     )
 
 
-def _tick(dsn, ns, shared_ns, org, correlation, target_tick):
+def _tick(dsn, ns, shared_ns, org, correlation, target_tick, *, observed_delay=timedelta()):
     """Fresh connections and a persistent schedule, not a direct domain E2E call."""
     with PostgresPersistence(dsn, namespace=ns) as domain:
         with PostgresPersistence(dsn, namespace=shared_ns) as shared:
@@ -117,7 +117,7 @@ def _tick(dsn, ns, shared_ns, org, correlation, target_tick):
             assert next_tick == target_tick, (org, next_tick, target_tick)
             result = _schedule(
                 domain, shared, organization=org, correlation=correlation,
-            ).run_due(now=ORIGIN + target_tick * INTERVAL)
+            ).run_due(now=ORIGIN + target_tick * INTERVAL + observed_delay)
             assert len(result) == 1
             assert domain.job_state(f"real-pc6-{org}").next_tick == target_tick + 1
             return result[0].actions
@@ -551,10 +551,9 @@ original_claim = BoundaryService.claim_next
 original_consume = BoundaryService.consume
 def claimed(self, **kwargs):
     if cut in ("after_claim", "inside_ack") and kwargs.get("destination_domain") == "logistics":
-        # Expire the dead worker's *physical* lease before its logical replay.
-        # The later recovered ACK still uses the reference slot's logical time.
+        # A one-second real lease expires before the restarted worker observes
+        # the same logical occurrence two seconds later; do not backdate claims.
         kwargs = dict(kwargs)
-        kwargs["now"] = kwargs["now"] - timedelta(hours=2)
         kwargs["lease_duration"] = timedelta(seconds=1)
     lease = original_claim(self, **kwargs)
     if cut == "after_claim" and lease is not None and kwargs.get("destination_domain") == "logistics":
@@ -578,8 +577,7 @@ def consumed(self, *, lease, registry, now):
             handler=kill_during_ack,
         )
         return original_consume(
-            self, lease=lease, registry=killing_registry,
-            now=now - timedelta(hours=2),
+            self, lease=lease, registry=killing_registry, now=now,
         )
     receipt = original_consume(self, lease=lease, registry=registry, now=now)
     if cut == "after_ack" and receipt is not None:
@@ -622,7 +620,10 @@ def _run_real_boundary_cut(dsn, *, cut=None):
     seeds = {org: values[:2] for org, values in seeded.items()}
     assert seeds["a"] == seeds["b"]
     if cut is None:
-        _tick(dsn, domains["a"], physical_ns, "a", seeds["a"][0], 0)
+        _tick(
+            dsn, domains["a"], physical_ns, "a", seeds["a"][0], 0,
+            observed_delay=timedelta(seconds=2),
+        )
     else:
         child = subprocess.run(
             [sys.executable, "-c", _KILL_REAL_BOUNDARY_PROCESS,
@@ -659,7 +660,7 @@ def _run_real_boundary_cut(dsn, *, cut=None):
             with PostgresPersistence(dsn, namespace=physical_ns) as physical:
                 replay = _schedule(
                     recovered, physical, organization="a", correlation=seeds["a"][0],
-                ).run_due(now=ORIGIN)
+                ).run_due(now=ORIGIN + timedelta(seconds=2))
                 assert len(replay) == 1
                 assert recovered.job_state("real-pc6-a").next_tick == 1
 
