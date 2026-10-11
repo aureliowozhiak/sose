@@ -78,10 +78,12 @@
   "break_even": {
     "symbol": "R*",
     "coordinate": "configured rho_nominal",
-    "definition": "all sign crossings of budget-matched structural versus capacity relative net benefit subject to throughput noninferiority",
+    "definition": "All adjacent-design-point sign-crossing brackets of paired g_a(rho)=p90_structural/p90_capacity_only-1 at equal charged lifecycle budget, conditional on throughput noninferiority on both sides",
     "no_root": "nonexistent",
     "multiple_roots": "nonunique_report_all",
-    "do_not_use_realized_regime_coords": true
+    "do_not_use_realized_regime_coords": true,
+    "estimation": "report discrete bracket and uncertainty; no unobserved interpolation, assumed uniqueness or monotonicity",
+    "type": "performance_equal_budget_not_unspecified_monetary_utility"
   },
   "manipulation_checks": [
     "strict_crn_for_unaffected_mechanisms",
