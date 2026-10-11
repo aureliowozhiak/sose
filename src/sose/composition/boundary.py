@@ -91,7 +91,9 @@ class BoundaryService:
             else self.persistence.transaction()
         )
 
-    def publish(self, message: BoundaryMessage) -> BoundaryDelivery:
+    def publish(
+        self, message: BoundaryMessage, *, recovery_job_id: str | None = None,
+    ) -> BoundaryDelivery:
         delivery = BoundaryDelivery.pending(message)
         with self._transaction() as uow:
             self._validate_causation(message, uow)
@@ -102,6 +104,26 @@ class BoundaryService:
                 )
             if existing_message is None:
                 self._validate_existing_descendants(message, uow)
+                # The publication and its bounded-trigger charge must commit
+                # together. A process dying immediately after this transaction
+                # cannot turn a published message into unaccounted free work.
+                if recovery_job_id is not None:
+                    from dataclasses import replace
+                    job = uow.get_job_state(recovery_job_id)
+                    if job is None or job.active_trigger_id is None:
+                        raise RuntimeError(
+                            "recovery publication lost its active recurring trigger"
+                        )
+                    if message.message_id in job.active_publication_message_ids:
+                        raise RuntimeError(
+                            "enrolled recovery publication is missing its message"
+                        )
+                    uow.save_job_state(replace(
+                        job,
+                        active_publication_message_ids=(
+                            *job.active_publication_message_ids, message.message_id,
+                        ),
+                    ))
                 uow.save_boundary_message(message)
 
             existing_delivery = uow.get_boundary_delivery(delivery.delivery_id)
