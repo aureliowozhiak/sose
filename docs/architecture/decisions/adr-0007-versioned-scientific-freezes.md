@@ -1,10 +1,10 @@
 # ADR-0007 — Versioned scientific freezes and historical replay gates
 
-- **Status:** Proposed — requires review and acceptance; does not supersede v1 freezes.
+- **Status:** Accepted — via OD-0 governance acceptance (issue #458), subject to green mandatory replay/CI and merge of the reviewed acceptance PR; does not supersede v1 freezes.
 - **Date:** 2026-10-09
 - **Related PRD/TRD:** PRD-0001, PRD-0003; TRD-0001, TRD-0003
 - **Related ADR:** ADR-0002, ADR-0005, ADR-0006
-- **Tracker:** [#397](https://github.com/brunolnetto/sose/issues/397)
+- **Trackers:** historical implementation [#397](https://github.com/brunolnetto/sose/issues/397) (closed); governance acceptance [#458](https://github.com/brunolnetto/sose/issues/458); program [#457](https://github.com/brunolnetto/sose/issues/457)
 
 ## Context
 
@@ -14,7 +14,7 @@ A subsequent attempted Warehouse Fulfillment PC6 maturity promotion modified the
 
 The source freeze must remain immutable, while the *location of replay verification* can be decoupled from the evolving main development tree.
 
-## Proposed decision
+## Decision
 
 1. **Immutable protocol history.** Each official v1 manifest, released evidence archive, code-tree identity, environment lock, protocol/plan hashes and result hashes remain unchanged. Existing release tags retain their historical source commits.
 2. **Development vs replay validation.** Current main CI executes current adapters and process-composition conformance. A separate **historical replay job** checks out the exact trusted frozen commit into an isolated worktree/environment, verifies the **domain-specific historical freeze** (selected file hashes and trusted preregistration anchor for Manufacturing; full source-tree and lockfile identities for O2C/MRO), executes the frozen experiment and compares canonical result hashes.
@@ -55,4 +55,59 @@ flowchart TD
 - Blocking all future `src/sose` changes: makes an experiment library unmaintainable.
 - Treating refactoring under a new HEAD as the same v1 experiment: risks post-hoc research decisions.
 
-**Decision gate:** ADR remains **Proposed** until a TDD implementation with separate current-main and historical replay jobs passes. No source-tree migration or PC6 promotion is authorized solely by this document.
+## Acceptance implementation and audit evidence
+
+The accepted policy is implemented by the separate
+[`historical-organizational-v1-replay.yml`](../../../.github/workflows/historical-organizational-v1-replay.yml)
+and its current-source fail-closed contract checker
+[`verify_organizational_v1_replay_contract.py`](../../../scripts/verify_organizational_v1_replay_contract.py).
+Acceptance is scoped to the independently verified replay mechanism; it is
+**not** an acceptance of uncalibrated Organizational Dynamics causal claims.
+
+The replay gate runs for changes to runtime sources, the dependency lock,
+scientific preregistrations, replay scripts, the pinned-digest registry,
+**this ADR** and its governance-regression tests. It checks out the exact
+published source commit for each experiment, installs the historical
+frozen environment and verifies original source identity **before** running
+the official v1 experiment. The published canonical file digests are
+compared to `.github/organizational-v1-published-digests.json`; the current
+source cannot substitute for the pinned historical checkout.
+
+The additional **pre-execution** governance checker validates the trusted
+Git-blob SHA `410ecb050eb3943997b184e36d6f70d73d40620c` for the released
+digest registry, the exact published source/result pairs, seven canonical
+files per domain, and each original preregistered freeze manifest Git blob.
+A simultaneous change to the workflow and its digest registry therefore
+does not silently redefine the v1 science.
+
+### Approved immutable source scopes
+
+| Domain | Historical source | Original freeze boundary |
+|---|---|---|
+| Manufacturing | `125fb707e5cbed05ac19e6d43bcd0736bd4b14f6` | Selected seven-file SHA-256 inventory, trusted preregistration Git blob, published canonical result digests |
+| O2C | `3c356fea6adba2d27f583d3a1469e5df1c0b651b` | Selected prerequisites **and** entire `src/sose` Git tree and `uv.lock` Git blob |
+| MRO | `3c356fea6adba2d27f583d3a1469e5df1c0b651b` | Selected prerequisites **and** entire `src/sose` Git tree and `uv.lock` Git blob |
+
+A new version of `ledger.py`, `projection.py` or `agency.py` is allowed
+to evolve on current `main`, but is never a modification of v1. The
+historical executable source and frozen v1 outputs remain immutable.
+Intervention/protocol changes require a **new** versioned experiment freeze.
+
+### TDD evidence and negative controls
+
+- Tampering with any published digest, source commit, preregistered
+  manifest or canonical file inventory fails before an official v1 replay.
+- Substituting `main` for the pinned checkout, changing a matrix result
+  hash, removing per-file SHA-256 checks, or suppressing ADR-triggered
+  historical CI fails the independent current-source governance suite.
+- Each historical replay reproduces the domain's registered `result_hash`
+  **and every canonical evidence file SHA-256**; incomplete/staged
+  evidence remains available for diagnosis and is not promoted.
+
+**Formal acceptance gate:** this ADR reaches the default branch only through
+a review-clean OD-0 pull request with passing governance-regression tests,
+all three historical replay jobs, and ordinary source coverage/CI. The
+earlier closed tracker #397 establishes the infrastructure but does not by
+itself constitute ADR acceptance. Additional scientific results are
+separately versioned and tested under OD-1 and OD-5a; this governance
+decision cannot rewrite Manufacturing/O2C/MRO v1 outcomes.
