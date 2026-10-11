@@ -547,6 +547,24 @@ jobs:
             tests/e2e/sose/persistence/test_postgres_pc6_federated_recovery.py
       - name: Run real multidomain recurring recovery integration
         run: python -m pytest -q tests/e2e/sose/persistence/test_postgres_pc6_full_real_domain_recovery.py
+      - name: Verify all eight real-domain causal restart certificates
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("pc6-real-multidomain.json").read_text())
+          cases = report["cases"]
+          assert report["protocol"] == "pc6-real-multidomain-recurring-v2"
+          assert len(cases) == 8, f"expected eight real worker-death windows; got {len(cases)}"
+          assert len({case["fault"] for case in cases}) == 8
+          assert report["all_equivalent"]
+          assert all(
+              case["equivalent"]
+              and case["reference_sha256"] == case["recovered_sha256"]
+              and case["certificates_per_organization"] == {"a": 4, "b": 4}
+              for case in cases
+          )
+          PY
       - name: Upload real multidomain recurring recovery report
         if: always()
         uses: actions/upload-artifact@v7
