@@ -81,8 +81,10 @@
     "censored_items"
   ],
   "analysis": {
-    "multiplicity": "Holm across three structural contrasts",
-    "resampling_unit": "exogenous_world",
+    "multiplicity": "Holm across all 21 primary arm-by-load comparisons",
+    "primary_family_size": 21,
+    "within_stratum_break_even_inference": "descriptive_until_separately_registered_simultaneous_inference",
+    "resampling_unit": "Sobol structural stratum preserving all seven load levels",
     "report_all_null_regions": true,
     "report_harmful_regions": true,
     "report_all_ineligible_worlds": true,
