@@ -751,9 +751,10 @@ _LATER_BOUNDARIES = (
 
 
 def _downstream_boundary_state(dsn, ns, contract):
-    """Read persisted publication/claim/ACK state, never a test-local stage."""
+    """Read persisted publication/claim/ACK under the current fenced epoch."""
     with PostgresPersistence(dsn, namespace=ns) as store:
-        with store.boundary_transaction() as uow:
+        # Observation must not claim writer ownership or bypass fencing.
+        with store.boundary_transaction(owner_epoch=store.writer_epoch()) as uow:
             matches = [
                 d for d in uow.boundary_deliveries()
                 if (d.contract_name, d.contract_version) ==
