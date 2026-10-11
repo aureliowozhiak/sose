@@ -316,10 +316,10 @@ class TradingCustomerRecoveryRunner:
             ]
             if pending:
                 source, effect_id = pending[0]
+                command = store.command(effect_id)
+                if command is None:
+                    raise RuntimeError("accepted effect disappeared before execution")
                 if resource_intents is not None:
-                    command = store.command(effect_id)
-                    if command is None:
-                        raise RuntimeError("accepted effect disappeared before resource admission")
                     demand_due = command.due_at
                     if (
                         command.name == "composition.deliver_shipment"
