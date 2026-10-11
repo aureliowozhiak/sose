@@ -46,6 +46,8 @@ class AccountingEvent(BaseModel):
     allocation: float = 1.0
     work_item_id: str | None = None
     secondary_labels: tuple[str, ...] = ()
+    cause: str | None = None
+    config_epoch: int | None = None
     model_spec_hash: str | None = None
 
     @model_validator(mode="after")
@@ -54,6 +56,13 @@ class AccountingEvent(BaseModel):
             raise ValueError("accounting event requires finite start < end")
         if not isfinite(self.allocation) or not 0.0 < self.allocation <= 1.0:
             raise ValueError("accounting event allocation must satisfy 0 < allocation <= 1")
+        if self.config_epoch is not None:
+            if isinstance(self.config_epoch, bool) or not isinstance(self.config_epoch, int) or self.config_epoch < 0:
+                raise ValueError("config_epoch must be a nonnegative integer")
+            if not self.model_spec_hash:
+                raise ValueError("config_epoch requires model_spec_hash provenance")
+        if self.cause is not None and not self.cause:
+            raise ValueError("accounting cause must be nonempty when supplied")
         if self.kind == "item":
             if self.item_category is None or self.actor_category is not None:
                 raise ValueError("item event requires only item_category")
@@ -75,6 +84,8 @@ class AccountingEvent(BaseModel):
         category: ItemCategory,
         secondary_labels: tuple[str, ...] = (),
         model_spec_hash: str | None = None,
+        cause: str | None = None,
+        config_epoch: int | None = None,
     ) -> "AccountingEvent":
         return cls(
             event_id=event_id,
@@ -86,6 +97,8 @@ class AccountingEvent(BaseModel):
             work_item_id=work_item_id,
             secondary_labels=secondary_labels,
             model_spec_hash=model_spec_hash,
+            cause=cause,
+            config_epoch=config_epoch,
         )
 
     @classmethod
@@ -101,6 +114,8 @@ class AccountingEvent(BaseModel):
         work_item_id: str | None = None,
         secondary_labels: tuple[str, ...] = (),
         model_spec_hash: str | None = None,
+        cause: str | None = None,
+        config_epoch: int | None = None,
     ) -> "AccountingEvent":
         return cls(
             event_id=event_id,
@@ -113,6 +128,8 @@ class AccountingEvent(BaseModel):
             work_item_id=work_item_id,
             secondary_labels=secondary_labels,
             model_spec_hash=model_spec_hash,
+            cause=cause,
+            config_epoch=config_epoch,
         )
 
 
@@ -144,13 +161,22 @@ class LedgerProjector:
             hashes = {event.model_spec_hash for event in active if event.model_spec_hash is not None}
             if len(hashes) > 1:
                 raise ValueError("overlapping item events span multiple model configurations")
+            epochs = {event.config_epoch for event in active if event.config_epoch is not None}
+            if len(epochs) > 1:
+                raise ValueError("overlapping item events span multiple config epochs")
+            winners = [event for event in active if event.item_category is category]
+            causes = {event.cause for event in winners}
+            if len(causes) > 1:
+                raise ValueError("ambiguous causal provenance for winning item category")
             labels = tuple(sorted({label for event in active for label in event.secondary_labels}))
             intervals.append(
                 ItemLedgerInterval(
                     start=start,
                     end=end,
                     primary=category,
+                    cause=next(iter(causes), None),
                     secondary_labels=labels,
+                    config_epoch=next(iter(epochs), None),
                     model_spec_hash=next(iter(hashes), None),
                 )
             )
@@ -172,7 +198,9 @@ class LedgerProjector:
                 category=_require_actor_category(event),
                 allocation=event.allocation,
                 work_item_id=event.work_item_id,
+                cause=event.cause,
                 secondary_labels=event.secondary_labels,
+                config_epoch=event.config_epoch,
                 model_spec_hash=event.model_spec_hash,
             )
             for event in events
@@ -217,9 +245,13 @@ def split_item_interval(
     *,
     at: float,
     next_model_spec_hash: str,
+    next_config_epoch: int | None = None,
 ) -> tuple[ItemLedgerInterval, ItemLedgerInterval]:
     if not interval.start < at < interval.end:
         raise ValueError("split point must be strictly inside the interval")
+    if (next_config_epoch is not None and interval.config_epoch is not None
+        and next_config_epoch <= interval.config_epoch):
+        raise ValueError("configuration transitions must advance config_epoch")
     shared = {
         "primary": interval.primary,
         "cause": interval.cause,
@@ -230,12 +262,14 @@ def split_item_interval(
             start=interval.start,
             end=at,
             model_spec_hash=interval.model_spec_hash,
+            config_epoch=interval.config_epoch,
             **shared,
         ),
         ItemLedgerInterval(
             start=at,
             end=interval.end,
             model_spec_hash=next_model_spec_hash,
+            config_epoch=next_config_epoch,
             **shared,
         ),
     )
