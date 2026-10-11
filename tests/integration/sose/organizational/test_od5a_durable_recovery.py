@@ -191,3 +191,51 @@ def test_durable_identity_does_not_alias_colon_bearing_item_station_pairs(tmp_pa
         assert set(state["completed"]) == {"a:b", "a"}
         assert len({e.event_id for e in events}) == len(events)
         assert not store.resource_reservations()
+
+
+@pytest.mark.parametrize("arm_id", [
+    "baseline", "capacity_only", "topology_only",
+    "coordination_only", "structural_combined",
+])
+def test_sqlite_reducer_matches_independent_simpy_pilot_trace(tmp_path, arm_id):
+    """Crash recovery alone is not proof of operational mechanism equivalence."""
+    from sose.organizational.od5a_mechanisms import run_od5a_pilot
+
+    arm = _arms()[arm_id]
+    reference = run_od5a_pilot(arm=arm, items=_items(), horizon=100.0)
+    durable_state, events, reservations = _finish(tmp_path / "conformance.db", arm_id)
+    assert not reservations and durable_state["done"]
+    reference_trace = sorted((
+        event.kind, event.item_id, event.source, event.target,
+        event.start, event.end, event.resource_instance,
+    ) for event in reference.events)
+    durable_trace = sorted((
+        event.payload["kind"], event.payload["item_id"],
+        event.payload["source"], event.payload["target"],
+        event.payload["start"], event.payload["end"],
+        event.payload["resource"],
+    ) for event in events if event.payload["kind"] != "arrival")
+    assert durable_trace == reference_trace
+    assert durable_state["completed"] == dict(reference.completed_at)
+
+
+def test_two_job_scoped_organizations_advance_without_cross_job_reservations(tmp_path):
+    shared = tmp_path / "organizations.db"
+    with SQLitePersistence(shared) as store:
+        initialize_od5a_durable(store, job_id="org-A", arm=_arms()["baseline"], items=_items())
+        initialize_od5a_durable(store, job_id="org-B", arm=_arms()["capacity_only"], items=_items())
+        for _ in range(200):
+            left = advance_od5a_durable(store, job_id="org-A")
+            right = advance_od5a_durable(store, job_id="org-B")
+            names = [reservation.resource_name for reservation in store.resource_reservations()]
+            assert len(names) == len(set(names))
+            assert all(name.startswith(("org-A/", "org-B/")) for name in names)
+            if not left and not right:
+                break
+        else:
+            pytest.fail("independent organizations did not terminate")
+        assert od5a_durable_state(store, job_id="org-A")["done"]
+        assert od5a_durable_state(store, job_id="org-B")["done"]
+        assert not store.resource_reservations()
+        assert {e.correlation_id for e in store.events()
+                if e.name.startswith("od5a.")} == {"org-A", "org-B"}
