@@ -57,6 +57,9 @@ class SimulationJobState:
     # Their business certificates debit this occurrence after process death.
     # Physically mapped effects use authoritative resource-ledger enrollment.
     active_effect_ids: tuple[str, ...] = ()
+    # Durable ingress receipts charged to the owning unfinished recurrence.
+    # A completed ACK is work even if its domain Command remains pending.
+    active_boundary_message_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.job_id:
@@ -89,6 +92,14 @@ class SimulationJobState:
             or len(self.active_effect_ids) != len(set(self.active_effect_ids))
         ):
             raise ValueError("active recovery effects require unique nonempty identities")
+        if (
+            any(not isinstance(message_id, str) or not message_id
+                for message_id in self.active_boundary_message_ids)
+            or len(self.active_boundary_message_ids) != len(
+                set(self.active_boundary_message_ids)
+            )
+        ):
+            raise ValueError("active recovery boundary messages require unique nonempty identities")
         if self.status not in {"ready", "running", "paused", "failed"}:
             raise ValueError(f"unsupported job status: {self.status}")
         if self.phase not in {"idle", "advance", "reconcile"}:
