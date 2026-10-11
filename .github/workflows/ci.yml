@@ -551,19 +551,43 @@ jobs:
         run: |
           python - <<'PY'
           import json
+          from hashlib import sha256
           from pathlib import Path
           report = json.loads(Path("pc6-real-multidomain.json").read_text())
           cases = report["cases"]
-          assert report["protocol"] == "pc6-real-multidomain-recurring-v2"
+          assert report["protocol"] == "pc6-real-multidomain-recurring-v3"
+          assert report["canonical_truth_schema_version"] == 1
           assert len(cases) == 11, f"expected eleven real worker-death windows; got {len(cases)}"
           assert len({case["fault"] for case in cases}) == 11
           assert report["all_equivalent"]
-          assert all(
-              case["equivalent"]
-              and case["reference_sha256"] == case["recovered_sha256"]
-              and case["certificates_per_organization"] == {"a": 4, "b": 4}
-              for case in cases
-          )
+          required = {
+              "semantic_digest", "typed_edges", "boundary_causal_edges",
+              "messages", "ack_receipts", "entities", "events", "certificates",
+              "binding", "scheduled", "resources", "stores", "containers",
+              "sinks", "position", "job_state",
+          }
+          for case in cases:
+              assert case["equivalent"]
+              assert case["certificates_per_organization"] == {"a": 4, "b": 4}
+              reference, replay = case["reference_truth"], case["recovered_truth"]
+              assert reference == replay, case["fault"]
+              assert set(reference) == {"organizations", "physical"}
+              assert set(reference["organizations"]) == {"a", "b"}
+              assert "reservations" in reference["physical"]
+              assert "events" in reference["physical"]
+              for organization in ("a", "b"):
+                  truth = reference["organizations"][organization]
+                  assert required <= set(truth), (case["fault"], organization)
+                  assert isinstance(truth["position"], dict)
+                  assert isinstance(truth["job_state"], dict)
+                  assert len(truth["certificates"]) == 4
+              for label, payload in (
+                  ("reference_sha256", reference),
+                  ("recovered_sha256", replay),
+              ):
+                  encoded = json.dumps(payload, sort_keys=True)
+                  assert case[label] == sha256(encoded.encode()).hexdigest()
+          assert all(case["reference_sha256"] == case["recovered_sha256"] for case in cases)
           PY
       - name: Upload real multidomain recurring recovery report
         if: always()
