@@ -406,6 +406,7 @@ jobs:
       SOSE_FULL_CHAOS_CANONICALS: "1"
       SOSE_FULL_CHAOS_PHASES: "1"
       SOSE_TEST_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/sose
+      SOSE_PC6_INFRA_CANONICAL_REPORT: pc6-infrastructure-canonical.json
 
     steps:
       - name: Checkout
@@ -435,6 +436,58 @@ jobs:
             tests/e2e/sose/persistence/test_postgres_infrastructure_chaos.py \
             tests/e2e/sose/persistence/test_postgres_pc6_uncertain_ack_commit.py \
             --junitxml=chaos-postgres-infrastructure.xml
+
+      - name: Verify full PC6 PostgreSQL infrastructure equivalence
+        run: |
+          python - <<'PY'
+          import json
+          from hashlib import sha256
+          from pathlib import Path
+
+          evidence = json.loads(Path("pc6-infrastructure-canonical.json").read_text())
+          cases = evidence["cases"]
+          expected = {
+              f"{transport}_{phase}"
+              for transport in ("proxy", "server")
+              for phase in ("before_commit", "after_commit")
+          }
+          assert evidence["protocol"] == "pc6-postgres-infrastructure-canonical-v1"
+          assert len(cases) == 4
+          assert {case["fault"] for case in cases} == expected
+          assert evidence["all_equivalent"]
+          for case in cases:
+              assert case["equivalent"]
+              assert case["reference_truth"] == case["recovered_truth"]
+              assert case["ack_outcome"] == (
+                  "rolled_back" if case["fault"].endswith("before_commit")
+                  else "committed"
+              )
+              for prefix in ("reference", "recovered"):
+                  serialized = json.dumps(case[f"{prefix}_truth"], sort_keys=True)
+                  assert sha256(serialized.encode()).hexdigest() == case[f"{prefix}_sha256"]
+                  observed = case[f"{prefix}_truth"]
+                  assert set(observed["organizations"]) == {"a", "b"}
+                  assert set(observed["physical"]) >= {"reservations", "events"}
+                  for org in ("a", "b"):
+                      item = observed["organizations"][org]
+                      assert len(item["certificates"]) == 4
+                      assert item["job_state"]["active_trigger_id"] is None
+                      assert set(item) >= {
+                          "semantic_digest", "typed_edges", "boundary_causal_edges",
+                          "messages", "ack_receipts", "entities", "events",
+                          "certificates", "binding", "scheduled", "resources",
+                          "stores", "containers", "sinks", "position", "job_state",
+                      }
+          PY
+
+      - name: Upload PC6 PostgreSQL canonical infrastructure evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pc6-postgres-infrastructure-canonical
+          path: pc6-infrastructure-canonical.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload PostgreSQL infrastructure chaos report
         if: always()
