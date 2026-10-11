@@ -633,17 +633,24 @@ def _run_real_boundary_cut(dsn, *, cut=None):
         with PostgresPersistence(dsn, namespace=domains["a"]) as dead:
             state = dead.job_state("real-pc6-a")
             assert state is not None and state.active_trigger_id is not None
-            delivery = BoundaryService(dead).delivery(seeded["a"][2])
-            assert delivery is not None
+            # After real worker death, PostgreSQL writer fencing is active.
+            # The audit must read using the current authoritative epoch,
+            # without acquiring a new writer or weakening the production API.
+            with dead.transaction(owner_epoch=dead.writer_epoch()) as uow:
+                delivery = uow.get_boundary_delivery(seeded["a"][2])
+                assert delivery is not None
+                receipt = uow.get_boundary_consumption(delivery.delivery_id)
             assert delivery.status is (
                 DeliveryStatus.CLAIMED if cut in {"after_claim", "inside_ack"}
                 else DeliveryStatus.CONSUMED
             )
             if cut == "after_ack":
                 assert dead.command(seeds["a"][1]) is not None
-                assert BoundaryService(dead).consumption(delivery.delivery_id) is not None
+                assert receipt is not None
+                assert receipt.consumer_effect_id == seeds["a"][1]
             else:
-                assert BoundaryService(dead).consumption(delivery.delivery_id) is None
+                assert receipt is None
+                assert dead.command(seeds["a"][1]) is None
 
     # Prove B can advance while A's original trigger remains unfinished.
     _tick(dsn, domains["b"], physical_ns, "b", seeds["b"][0], 0)
