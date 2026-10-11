@@ -17,13 +17,26 @@
     "structural_combined:capacity_only"
   ],
   "allocation": {
-    "design": "sobol",
-    "n_worlds": 64,
+    "design": "sobol_nonload_strata_crossed_with_fixed_load_grid",
     "replications_per_world_arm": 16,
     "crn": "counter_rng_mechanism_entity_draw_index",
     "root_seed": "UNSET_AT_EXECUTION_FREEZE",
     "bounds": "UNSET_AT_EXECUTION_FREEZE",
-    "fixed_horizon": "UNSET_AT_EXECUTION_FREEZE"
+    "fixed_horizon": "UNSET_AT_EXECUTION_FREEZE",
+    "n_sobol_nonload_strata": 32,
+    "rho_nominal_grid": [
+      0.4,
+      0.6,
+      0.8,
+      1,
+      1.2,
+      1.4,
+      1.6
+    ],
+    "n_configured_worlds": 224,
+    "n_arm_world_replications": 17920,
+    "rho_nominal_denominator": "baseline nominal execution capacity, not treated or realized capacity",
+    "exogenous_stratum_rule": "hold every non-load coordinate fixed across all seven load values"
   },
   "exogenous_coordinates": [
     "rho_nominal",
