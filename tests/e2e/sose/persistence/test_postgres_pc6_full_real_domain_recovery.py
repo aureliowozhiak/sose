@@ -262,13 +262,20 @@ from sose.composition.scheduler import RecoverySchedule
 from sose.core.resource_identity import ResourcePoolContract
 from sose.examples.order_to_cash import simulation as o2c
 from sose.persistence.postgres import PostgresPersistence
-dsn, domain_ns, physical_ns, corr, cut = sys.argv[1:]
+dsn, domain_ns, physical_ns, corr, cut, *tail = sys.argv[1:]
+slot = int(tail[0]) if tail else 0
 old = TradingCustomerRecoveryRunner._execute_pending
 def killed(store, source, effect_id, *, authoritative_pickup=None, resource_persistence=None):
     old(store, source, effect_id,
         authoritative_pickup=authoritative_pickup,
         resource_persistence=resource_persistence)
-    if cut == "after_logistics_effect" and source.contract_key == "warehouse.dispatch_ready.v1":
+    selected = {
+        "after_logistics_effect": "warehouse.dispatch_ready.v1",
+        "after_o2c_effect": "logistics.delivery_completed.v1",
+        "after_payments_effect": "o2c.payment_requested.v1",
+        "after_r2r_effect": "accounting.entry_requested.v1",
+    }
+    if source.contract_key == selected.get(cut):
         assert store.command(effect_id) is None
         assert any(c.effect_id == effect_id for c in store.business_effects())
         os._exit(79)
@@ -288,7 +295,7 @@ with PostgresPersistence(dsn, namespace=domain_ns) as domain:
         )
         RecoverySchedule(
             runner, start_at=o2c.ORIGIN, interval=timedelta(hours=1), max_slots=1,
-        ).run_due(now=o2c.ORIGIN)
+        ).run_due(now=o2c.ORIGIN + slot * timedelta(hours=1))
 raise AssertionError("OS-kill probe did not reach target")
 """
 
@@ -317,3 +324,80 @@ def test_pg_two_full_real_domain_chains_replay_worker_death_with_shared_physical
     ))
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")
+
+
+def _pending_domain_effect(dsn, ns, intent_name):
+    from sose.composition.model import DeliveryStatus
+
+    with PostgresPersistence(dsn, namespace=ns) as store:
+        with store.transaction(owner_epoch=store.writer_epoch()) as uow:
+            for delivery in uow.boundary_deliveries():
+                if delivery.status is not DeliveryStatus.CONSUMED:
+                    continue
+                receipt = uow.get_boundary_consumption(delivery.delivery_id)
+                if receipt is None:
+                    raise RuntimeError("consumed delivery lost its durable receipt")
+                command = uow.get_command(receipt.consumer_effect_id)
+                if command is not None and command.name == intent_name:
+                    return True
+    return False
+
+
+def _run_real_domain_cut(dsn, *, name, killed):
+    domains = {"a": _name("pc6cut_a"), "b": _name("pc6cut_b")}
+    shared_ns = _name("pc6cut_physical")
+    seeds = {org: _seed_real_workflow(dsn, ns) for org, ns in domains.items()}
+    slot = 0
+    while not _pending_domain_effect(dsn, domains["a"], name):
+        assert slot < 18, f"target domain never acquired a durable Command: {name}"
+        _tick(dsn, domains["a"], shared_ns, "a", seeds["a"][0], slot)
+        slot += 1
+    assert not _terminal(dsn, domains["a"])
+    if killed:
+        cut = {
+            DOMAINS[0]: "after_logistics_effect",
+            DOMAINS[1]: "after_o2c_effect",
+            DOMAINS[2]: "after_payments_effect",
+            DOMAINS[3]: "after_r2r_effect",
+        }[name]
+        child = subprocess.run(
+            [sys.executable, "-c", _KILL_PROCESS, dsn, domains["a"],
+             shared_ns, seeds["a"][0], cut, str(slot)],
+            capture_output=True, text=True, check=False, timeout=90,
+        )
+        assert child.returncode == 79, (name, child.stderr[-1800:])
+        with PostgresPersistence(dsn, namespace=domains["a"]) as dead:
+            assert dead.job_state("real-pc6-a").active_trigger_id is not None
+            assert any(c.entity_type == {
+                DOMAINS[0]: "shipment", DOMAINS[1]: "sales_order",
+                DOMAINS[2]: "card_payment", DOMAINS[3]: "journal_entry",
+            }[name] for c in dead.business_effects())
+    else:
+        _tick(dsn, domains["a"], shared_ns, "a", seeds["a"][0], slot)
+
+    # Deliberately progress B while A's initial occurrence remains unfinished.
+    _tick(dsn, domains["b"], shared_ns, "b", seeds["b"][0], 0)
+    if killed:
+        with PostgresPersistence(dsn, namespace=domains["a"]) as a:
+            with PostgresPersistence(dsn, namespace=shared_ns) as physical:
+                replayed = _schedule(
+                    a, physical, organization="a", correlation=seeds["a"][0],
+                ).run_due(now=ORIGIN + slot * INTERVAL)
+                assert len(replayed) == 1
+                assert a.job_state("real-pc6-a").next_tick == slot + 1
+
+    for org, first_slot in (("a", slot + 1), ("b", 1)):
+        for n in range(first_slot, 25):
+            if _terminal(dsn, domains[org]):
+                break
+            _tick(dsn, domains[org], shared_ns, org, seeds[org][0], n)
+        assert _terminal(dsn, domains[org])
+    return _proof(dsn, domains, shared_ns, seeds)
+
+
+def test_pg_real_o2c_certification_after_os_kill_preserves_recurring_slot():
+    """Real O2C certification must not advance the next effect into the old slot."""
+    assert DSN is not None
+    baseline = _run_real_domain_cut(DSN, name=DOMAINS[1], killed=False)
+    recovered = _run_real_domain_cut(DSN, name=DOMAINS[1], killed=True)
+    assert recovered == baseline
