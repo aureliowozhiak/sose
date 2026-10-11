@@ -46,6 +46,7 @@ class IntentResourceCoordinator:
         slot_duration: timedelta,
         retry_delay: timedelta,
         owner_epoch: int | None = None,
+        writer_scope: str | None = None,
         fencing_persistence=None,
         effect_scope: str | None = None,
     ) -> None:
@@ -60,6 +61,9 @@ class IntentResourceCoordinator:
         # not to the separately owned shared physical resource ledger.
         self._fencing_persistence = fencing_persistence or persistence
         self._owner_epoch = owner_epoch
+        self._writer_scope = writer_scope
+        if writer_scope is not None and (not writer_scope or owner_epoch is None):
+            raise ValueError('scoped resource admission requires a valid writer epoch')
         self._effect_scope = effect_scope
         self._db = persistence._connection
         self._policies = dict(policies)
@@ -186,7 +190,10 @@ class IntentResourceCoordinator:
         # but fences workers whose epoch was superseded.
         if self._owner_epoch is None:
             return nullcontext()
-        return self._fencing_persistence.transaction(owner_epoch=self._owner_epoch)
+        kwargs = {'owner_epoch': self._owner_epoch}
+        if self._writer_scope is not None:
+            kwargs['writer_scope'] = self._writer_scope
+        return self._fencing_persistence.transaction(**kwargs)
 
     def admit(self, *, effect_id: str, intent_name: str,
               organization_id: str, due_at: datetime, now: datetime,

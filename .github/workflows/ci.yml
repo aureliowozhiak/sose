@@ -599,7 +599,8 @@ jobs:
             tests/e2e/sose/persistence/test_postgres_pc6_authoritative_pickup.py \
             tests/e2e/sose/persistence/test_postgres_resource_release_race.py \
             tests/e2e/sose/persistence/test_postgres_pc6_federated_recovery.py \
-            tests/e2e/sose/persistence/test_postgres_pc6_same_org_fencing.py
+            tests/e2e/sose/persistence/test_postgres_pc6_same_org_fencing.py \
+            tests/e2e/sose/persistence/test_postgres_pc6_recurring_organization_recovery.py
       - name: Run real multidomain recurring recovery integration
         run: python -m pytest -q tests/e2e/sose/persistence/test_postgres_pc6_full_real_domain_recovery.py
       - name: Verify twenty-three real-domain and boundary restart certificates
