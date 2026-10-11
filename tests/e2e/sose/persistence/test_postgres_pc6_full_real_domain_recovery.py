@@ -395,9 +395,10 @@ def _run_real_domain_cut(dsn, *, name, killed):
     return _proof(dsn, domains, shared_ns, seeds)
 
 
-def test_pg_real_o2c_certification_after_os_kill_preserves_recurring_slot():
-    """Real O2C certification must not advance the next effect into the old slot."""
+@pytest.mark.parametrize("intent_name", DOMAINS[1:])
+def test_pg_real_nonphysical_domain_certification_after_os_kill_preserves_slot(intent_name):
+    """No certified business effect may advance its original slot after death."""
     assert DSN is not None
-    baseline = _run_real_domain_cut(DSN, name=DOMAINS[1], killed=False)
-    recovered = _run_real_domain_cut(DSN, name=DOMAINS[1], killed=True)
+    baseline = _run_real_domain_cut(DSN, name=intent_name, killed=False)
+    recovered = _run_real_domain_cut(DSN, name=intent_name, killed=True)
     assert recovered == baseline
