@@ -222,6 +222,7 @@ def _publish(
     produced_at: datetime,
     payload: dict[str, object],
     contract_version: int = 1,
+    recovery_job_id: str | None = None,
 ) -> BoundaryMessage:
     message = BoundaryMessage.create(
         contract_name=contract_name,
@@ -235,7 +236,7 @@ def _publish(
         produced_at=produced_at,
         payload=payload,
     )
-    service.publish(message)
+    service.publish(message, recovery_job_id=recovery_job_id)
     return message
 
 
@@ -919,6 +920,7 @@ def _execute_intent(
 def reconcile_shipped_fulfillment_egress(
     persistence: MemoryPersistence, *, correlation_id: str | None = None,
     max_new_messages: int | None = None,
+    recovery_job_id: str | None = None,
 ) -> tuple[BoundaryMessage, ...]:
     """Rebuild outbound WF contracts solely from durable inbound messages and state.
 
@@ -990,6 +992,7 @@ def reconcile_shipped_fulfillment_egress(
             destination_domain=destination_domain, occurrence_key=occurrence_key,
             correlation_id=correlation, causation_id=causation,
             produced_at=produced_at, payload=payload,
+            recovery_job_id=recovery_job_id,
         )
 
     for reservation in sorted(reservations, key=lambda m: m.message_id):
@@ -1129,6 +1132,7 @@ def reconcile_shipped_fulfillment_egress(
 def reconcile_completed_logistics_egress(
     persistence: MemoryPersistence, *, correlation_id: str | None = None,
     max_new_messages: int | None = None,
+    recovery_job_id: str | None = None,
 ) -> tuple[BoundaryMessage, ...]:
     """Recover Logistics delivery completion solely from committed domain truth.
 
@@ -1214,7 +1218,7 @@ def reconcile_completed_logistics_egress(
             break
         if max_new_messages is not None:
             max_new_messages -= 1
-        service.publish(message)
+        service.publish(message, recovery_job_id=recovery_job_id)
         outgoing.append(message)
     return tuple(outgoing)
 
@@ -1222,6 +1226,7 @@ def reconcile_completed_logistics_egress(
 def reconcile_invoiced_o2c_egress(
     persistence: MemoryPersistence, *, correlation_id: str | None = None,
     max_new_messages: int | None = None,
+    recovery_job_id: str | None = None,
 ) -> tuple[BoundaryMessage, ...]:
     """Derive payment requests from committed O2C invoicing and causal ACKs.
 
@@ -1318,7 +1323,7 @@ def reconcile_invoiced_o2c_egress(
             continue
         if max_new_messages is not None and max_new_messages == 0:
             break
-        service.publish(outgoing)
+        service.publish(outgoing, recovery_job_id=recovery_job_id)
         if max_new_messages is not None:
             max_new_messages -= 1
         emitted.append(outgoing)
@@ -1328,6 +1333,7 @@ def reconcile_invoiced_o2c_egress(
 def reconcile_settled_payment_egress(
     persistence: MemoryPersistence, *, correlation_id: str | None = None,
     max_new_messages: int | None = None,
+    recovery_job_id: str | None = None,
 ) -> tuple[BoundaryMessage, ...]:
     """Emit R2R work only after committed payment settlement business truth."""
     if max_new_messages is not None and max_new_messages < 0:
@@ -1416,7 +1422,7 @@ def reconcile_settled_payment_egress(
             continue
         if max_new_messages is not None and max_new_messages == 0:
             break
-        service.publish(message)
+        service.publish(message, recovery_job_id=recovery_job_id)
         if max_new_messages is not None:
             max_new_messages -= 1
         results.append(message)

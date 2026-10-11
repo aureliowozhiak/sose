@@ -736,3 +736,232 @@ def test_pc6_bundle_publishes_full_canonical_continuous_and_recovered_truth(
     assert case["reference_truth"]["physical"]["reservations"] == [
         "finite-physical-courier"
     ]
+
+
+# The following matrix executes the *real* downstream boundary consumers and
+# domain statecharts; it does not use #447's deterministic terminal fixtures.
+_LATER_BOUNDARIES = (
+    ("order_to_cash", CONTRACTS[1], "shipment",
+     "reconcile_completed_logistics_egress"),
+    ("cards_payments", CONTRACTS[2], "sales_order",
+     "reconcile_invoiced_o2c_egress"),
+    ("record_to_report", CONTRACTS[3], "card_payment",
+     "reconcile_settled_payment_egress"),
+)
+
+
+def _downstream_boundary_state(dsn, ns, contract):
+    """Read persisted publication/claim/ACK under the current fenced epoch."""
+    with PostgresPersistence(dsn, namespace=ns) as store:
+        # Observation must not claim writer ownership or bypass fencing.
+        with store.boundary_transaction(owner_epoch=store.writer_epoch()) as uow:
+            matches = [
+                d for d in uow.boundary_deliveries()
+                if (d.contract_name, d.contract_version) ==
+                (contract.rsplit(".v", 1)[0], int(contract.rsplit(".v", 1)[1]))
+            ]
+            if not matches:
+                return None
+            assert len(matches) == 1, (contract, matches)
+            delivery = matches[0]
+            receipt = uow.get_boundary_consumption(delivery.delivery_id)
+            return delivery, receipt
+
+
+def _prepare_downstream_cut(dsn, ns, physical_ns, org, corr, *, contract,
+                            predecessor_type, cut):
+    """Stop BEFORE the faulting recurrence; prerequisite state is genuinely certified."""
+    for slot in range(24):
+        boundary = _downstream_boundary_state(dsn, ns, contract)
+        with PostgresPersistence(dsn, namespace=ns) as store:
+            antecedent = any(
+                effect.entity_type == predecessor_type
+                for effect in store.business_effects()
+            )
+        if cut == "after_publish":
+            if antecedent and boundary is None:
+                return slot
+        elif boundary is not None and boundary[0].status.value == "pending":
+            assert antecedent
+            return slot
+        _tick(dsn, ns, physical_ns, org, corr, slot)
+    raise AssertionError(
+        f"real {contract} never reached an interruptible {cut} boundary"
+    )
+
+
+_KILL_LATER_BOUNDARY_PROCESS = """
+import os, sys
+from datetime import timedelta
+from sose.composition import trading_company_customer as customer
+from sose.composition.boundary import BoundaryConsumerRegistry, BoundaryService
+from sose.composition.recovery import TradingCustomerRecoveryRunner
+from sose.composition.scheduler import RecoverySchedule
+from sose.core.resource_identity import ResourcePoolContract
+from sose.examples.order_to_cash import simulation as o2c
+from sose.persistence.postgres import PostgresPersistence
+
+dsn, domain_ns, physical_ns, correlation, destination, contract, publisher, cut, slot = sys.argv[1:]
+slot = int(slot)
+original_claim = BoundaryService.claim_next
+original_consume = BoundaryService.consume
+
+def claimed(self, **kwargs):
+    if kwargs.get("destination_domain") == destination:
+        kwargs = dict(kwargs)
+        kwargs["lease_duration"] = timedelta(seconds=1)
+    lease = original_claim(self, **kwargs)
+    if cut == "after_claim" and lease is not None and kwargs.get("destination_domain") == destination:
+        with self._transaction() as uow:
+            msg = uow.get_boundary_message(lease.message_id)
+        assert msg is not None and msg.contract_key == contract
+        os._exit(79)
+    return lease
+
+def consumed(self, *, lease, registry, now):
+    with self._transaction() as uow:
+        msg = uow.get_boundary_message(lease.message_id)
+    if msg is None or msg.contract_key != contract:
+        return original_consume(self, lease=lease, registry=registry, now=now)
+    if cut == "inside_ack":
+        handler = registry.resolve(msg)
+        killing_registry = BoundaryConsumerRegistry()
+        def kill_during_ack(inbound, uow):
+            effect_id = handler(inbound, uow)
+            assert uow.get_command(effect_id) is not None
+            os._exit(79)  # Before ACK+Command COMMIT, actual worker death.
+        killing_registry.register(
+            destination_domain=msg.destination_domain,
+            contract_name=msg.contract_name,
+            contract_version=msg.contract_version,
+            handler=kill_during_ack,
+        )
+        return original_consume(self, lease=lease, registry=killing_registry, now=now)
+    receipt = original_consume(self, lease=lease, registry=registry, now=now)
+    if cut == "after_ack":
+        assert receipt is not None
+        assert self.persistence.command(receipt.consumer_effect_id) is not None
+        os._exit(79)  # After atomic ACK+Command COMMIT.
+    return receipt
+
+BoundaryService.claim_next = claimed
+BoundaryService.consume = consumed
+
+if cut == "after_publish":
+    original_publish = getattr(customer, publisher)
+    def published(*args, **kwargs):
+        result = original_publish(*args, **kwargs)
+        if result:
+            assert any(message.contract_key == contract for message in result)
+            os._exit(79)  # Durable publish, before recurring checkpoint.
+        return result
+    setattr(customer, publisher, published)
+
+with PostgresPersistence(dsn, namespace=domain_ns) as domain:
+    with PostgresPersistence(dsn, namespace=physical_ns) as physical:
+        runner = TradingCustomerRecoveryRunner(
+            persistence=domain, owner_id="fatal-real-downstream-a",
+            job_id="real-pc6-a", max_actions=1,
+            resource_persistence=physical,
+            resource_policies={
+                "composition.deliver_shipment": ResourcePoolContract(
+                    resource_type="pickup_courier", pool_id="pc6-real-crossdomain",
+                    scope="shared", capacity=1,
+                ),
+            },
+            resource_organizations={correlation: "a"},
+            resource_slot_duration=timedelta(minutes=5),
+            resource_retry_delay=timedelta(minutes=5),
+        )
+        RecoverySchedule(
+            runner, start_at=o2c.ORIGIN, interval=timedelta(hours=1),
+            max_slots=1,
+        ).run_due(now=o2c.ORIGIN + slot * timedelta(hours=1))
+raise AssertionError("downstream OS-kill hook was not reached")
+"""
+
+
+def _run_later_boundary_cut(dsn, *, destination, contract, predecessor_type,
+                            publisher, cut, killed=False):
+    """Each cut has its own uninterrupted baseline and full canonical oracle."""
+    from sose.composition.model import DeliveryStatus
+
+    domains = {"a": _name("pc6later_a"), "b": _name("pc6later_b")}
+    physical_ns = _name("pc6later_shared")
+    seeded = {org: _seed_before_logistics_ack(dsn, ns) for org, ns in domains.items()}
+    seeds = {org: values[:2] for org, values in seeded.items()}
+    assert seeds["a"] == seeds["b"]
+    slot = _prepare_downstream_cut(
+        dsn, domains["a"], physical_ns, "a", seeds["a"][0],
+        contract=contract, predecessor_type=predecessor_type, cut=cut,
+    )
+    if not killed:
+        _tick(
+            dsn, domains["a"], physical_ns, "a", seeds["a"][0], slot,
+            observed_delay=timedelta(seconds=2),
+        )
+    else:
+        child = subprocess.run(
+            [sys.executable, "-c", _KILL_LATER_BOUNDARY_PROCESS, dsn,
+             domains["a"], physical_ns, seeds["a"][0], destination,
+             contract, publisher, cut, str(slot)],
+            capture_output=True, text=True, check=False, timeout=90,
+        )
+        assert child.returncode == 79, (destination, cut, child.stderr[-2400:])
+        with PostgresPersistence(dsn, namespace=domains["a"]) as dead:
+            job = dead.job_state("real-pc6-a")
+            assert job is not None and job.active_trigger_id is not None
+            current = _downstream_boundary_state(dsn, domains["a"], contract)
+            assert current is not None
+            delivery, receipt = current
+            if cut == "after_publish":
+                assert delivery.status is DeliveryStatus.PENDING
+            elif cut in ("after_claim", "inside_ack"):
+                assert delivery.status is DeliveryStatus.CLAIMED
+                assert receipt is None
+            else:
+                assert delivery.status is DeliveryStatus.CONSUMED
+                assert receipt is not None
+                assert dead.command(receipt.consumer_effect_id) is not None
+
+    # B progresses on its independent writer epoch while A is genuinely dead.
+    _tick(dsn, domains["b"], physical_ns, "b", seeds["b"][0], 0)
+    if killed:
+        with PostgresPersistence(dsn, namespace=domains["a"]) as domain:
+            with PostgresPersistence(dsn, namespace=physical_ns) as physical:
+                replay = _schedule(
+                    domain, physical, organization="a", correlation=seeds["a"][0],
+                ).run_due(now=ORIGIN + slot * INTERVAL + timedelta(seconds=2))
+                assert len(replay) == 1
+                assert domain.job_state("real-pc6-a").next_tick == slot + 1
+
+    for org, first in (("a", slot + 1), ("b", 1)):
+        for tick in range(first, 30):
+            if _terminal(dsn, domains[org]):
+                break
+            _tick(dsn, domains[org], physical_ns, org, seeds[org][0], tick)
+        assert _terminal(dsn, domains[org]), (destination, cut, org)
+    return _proof(dsn, domains, physical_ns, seeds)
+
+
+@pytest.mark.parametrize(
+    "destination,contract,predecessor_type,publisher", _LATER_BOUNDARIES,
+)
+@pytest.mark.parametrize(
+    "cut", ("after_publish", "after_claim", "inside_ack", "after_ack"),
+)
+def test_pg_real_downstream_boundary_oskill_preserves_canonical_recovery(
+    destination, contract, predecessor_type, publisher, cut,
+):
+    """No synthetic statecharts, no new trigger, no loss of the physical ledger."""
+    assert DSN is not None
+    options = dict(
+        destination=destination, contract=contract,
+        predecessor_type=predecessor_type, publisher=publisher,
+    )
+    baseline = _run_later_boundary_cut(DSN, **options, cut=cut)
+    recovered = _run_later_boundary_cut(DSN, **options, cut=cut, killed=True)
+    assert recovered == baseline, (destination, cut)
+    _record_equivalence(
+        f"real_{destination}_{cut}", baseline, recovered,
+    )
