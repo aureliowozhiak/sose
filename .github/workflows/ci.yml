@@ -545,6 +545,17 @@ jobs:
             tests/e2e/sose/persistence/test_postgres_pc6_authoritative_pickup.py \
             tests/e2e/sose/persistence/test_postgres_resource_release_race.py \
             tests/e2e/sose/persistence/test_postgres_pc6_federated_recovery.py
+      - name: Run real multidomain recurring recovery integration
+        run: python -m pytest -q tests/e2e/sose/persistence/test_postgres_pc6_full_real_domain_recovery.py
+      - name: Upload real multidomain recurring recovery report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pc6-real-multidomain-recurring
+          path: pc6-real-multidomain.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload PC6 real OS-kill multidomain boundary matrix
         if: always()
         uses: actions/upload-artifact@v7
