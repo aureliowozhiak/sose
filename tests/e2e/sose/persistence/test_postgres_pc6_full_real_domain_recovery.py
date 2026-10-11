@@ -28,6 +28,7 @@ from sose.core.resource_identity import ResourcePoolContract
 from sose.core.resource_reservations import authoritative_effect_reservation_id
 from sose.examples.order_to_cash import simulation as o2c
 from sose.persistence.postgres import PostgresPersistence
+from sose.persistence.ownership import FencedEnginePersistence
 
 DSN = os.environ.get("SOSE_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="SOSE_TEST_POSTGRES_DSN is required")
@@ -164,14 +165,18 @@ def _proof(dsn, domains, physical_ns, seeds):
     evidence = {}
     for org, ns in sorted(domains.items()):
         with PostgresPersistence(dsn, namespace=ns) as store:
-            certs = store.business_effects()
+            audit_lease = store.claim_writer(
+                f"pc6-audit-{org}", expected_epoch=store.writer_epoch(),
+            )
+            view = FencedEnginePersistence(store, audit_lease)
+            certs = view.business_effects()
             assert len(certs) == 4, (org, certs)
             assert {c.entity_type for c in certs} == {
                 "shipment", "sales_order", "card_payment", "journal_entry",
             }
             assert all(store.command(c.effect_id) is None for c in certs)
-            audit = audit_causal_history(store)
-            with store.boundary_transaction() as uow:
+            audit = audit_causal_history(view)
+            with view.boundary_transaction() as uow:
                 deliveries = tuple(uow.boundary_deliveries())
                 relevant = tuple(sorted(
                     (d.message_id, d.status.value, d.consumer_effect_id,
@@ -181,7 +186,7 @@ def _proof(dsn, domains, physical_ns, seeds):
                 messages = tuple(
                     uow.get_boundary_message(d.message_id) for d in deliveries
                 )
-            binding = SettlementBindingService(store).for_order(
+            binding = SettlementBindingService(view).for_order(
                 next(c.entity_id for c in certs if c.entity_type == "sales_order")
             )
             assert binding is not None
