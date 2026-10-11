@@ -323,6 +323,46 @@ raise AssertionError("OS-kill probe did not reach target")
 """
 
 
+def _record_equivalence(name, baseline, recovered, *, default_path=None):
+    """Append an auditable independently verified cut; do not only certify one."""
+    target = os.environ.get("SOSE_PC6_REAL_MULTIDOMAIN_REPORT")
+    if target is None and default_path is None:
+        return
+    destination = Path(target if target is not None else default_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    report = (
+        json.loads(destination.read_text(encoding="utf-8"))
+        if destination.exists() else {
+            "protocol": "pc6-real-multidomain-recurring-v2",
+            "organizations": ["a", "b"],
+            "real_domain_handlers": list(DOMAINS),
+            "physical_pool": "pickup_courier/shared/pc6-real-crossdomain/capacity-1",
+            "termination": "os._exit(79) in separate worker process",
+            "cases": [],
+        }
+    )
+    reference = json.dumps(baseline, sort_keys=True, default=str)
+    replay = json.dumps(recovered, sort_keys=True, default=str)
+    case = {
+        "fault": name,
+        "equivalent": baseline == recovered,
+        "reference_sha256": sha256(reference.encode()).hexdigest(),
+        "recovered_sha256": sha256(replay.encode()).hexdigest(),
+        "certificates_per_organization": {
+            org: len(baseline["organizations"][org]["certificates"])
+            for org in ("a", "b")
+        },
+    }
+    if any(entry["fault"] == name for entry in report["cases"]):
+        raise AssertionError(f"duplicated certified fault case: {name}")
+    report["cases"].append(case)
+    report["cases"].sort(key=lambda item: item["fault"])
+    report["all_equivalent"] = all(entry["equivalent"] for entry in report["cases"])
+    destination.write_text(
+        json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8",
+    )
+
+
 def test_pg_two_full_real_domain_chains_replay_worker_death_with_shared_physical_pool(
     tmp_path,
 ):
@@ -330,23 +370,10 @@ def test_pg_two_full_real_domain_chains_replay_worker_death_with_shared_physical
     baseline = _run(DSN)
     recovered = _run(DSN, killed=True)
     assert recovered == baseline
-    reference = json.dumps(baseline, sort_keys=True, default=str)
-    resumed = json.dumps(recovered, sort_keys=True, default=str)
-    report = {
-        "protocol": "pc6-real-multidomain-recurring-v1",
-        "case": "os._exit(79) after real Logistics statechart certificate before physical release",
-        "organizations": ["a", "b"],
-        "domains": DOMAINS,
-        "equal": resumed == reference,
-        "reference_sha256": sha256(reference.encode()).hexdigest(),
-        "recovered_sha256": sha256(resumed.encode()).hexdigest(),
-    }
-    dest = Path(os.environ.get(
-        "SOSE_PC6_REAL_MULTIDOMAIN_REPORT",
-        str(tmp_path / "pc6-real-multidomain.json"),
-    ))
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n")
+    _record_equivalence(
+        "after_logistics_certificate", baseline, recovered,
+        default_path=tmp_path / "pc6-real-multidomain.json",
+    )
 
 
 def _pending_domain_effect(dsn, ns, intent_name):
@@ -438,6 +465,7 @@ def test_pg_real_nonphysical_domain_certification_after_os_kill_preserves_slot(i
     baseline = _run_real_domain_cut(DSN, name=intent_name, killed=False)
     recovered = _run_real_domain_cut(DSN, name=intent_name, killed=True)
     assert recovered == baseline
+    _record_equivalence(f"after_{intent_name}_certificate", baseline, recovered)
 
 
 @pytest.mark.parametrize("intent_name", DOMAINS)
@@ -449,3 +477,4 @@ def test_pg_real_statechart_commits_but_worker_dies_before_business_certificate(
         DSN, name=intent_name, killed=True, before_certificate=True,
     )
     assert resumed == baseline
+    _record_equivalence(f"before_{intent_name}_certificate", baseline, resumed)
