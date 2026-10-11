@@ -26,7 +26,7 @@ Attach explicit cause IDs to every affected ledger item and actor allocation. Us
 ## 4. Outcome and statistical contract
 
 Paired primary response for structural arm `a`:
-`g_a(rho) = p90_lead_time(a,rho)/p90_lead_time(capacity_only,rho) - 1`; reject a zero-reference denominator as reported ineligible. Require upper 95% CI below **−0.05** for practical p90 superiority and throughput ratio noninferiority **>= 0.98**. Use `Holm` multiplicity correction across exactly three structural contrasts and resample at the exogenous-world level.
+`g_a(rho) = p90_lead_time(a,rho)/p90_lead_time(capacity_only,rho) - 1`; reject a zero-reference denominator as reported ineligible. Require upper 95% CI below **−0.05** for practical p90 superiority and throughput ratio noninferiority **>= 0.98**. Use `Holm` multiplicity correction over **all 21 primary comparisons (three structural arms × seven configured load levels)** and resample at the **32 Sobol structural stratum** level, preserving each stratum's complete seven-point load sweep. Individual-stratum `R*` brackets are descriptive and cannot by themselves establish a confirmatory region.
 
 Report full cohort, incomplete/censored items, uncertainty, adverse/null/unidentifiable regions, cost accounting and sensitivity. Comparisons may not be retuned after any confirmatory result inspection. Negative controls include an intentionally harmful structural change and a capacity-only change forbidden from changing routing.
 
