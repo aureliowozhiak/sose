@@ -547,7 +547,7 @@ jobs:
             tests/e2e/sose/persistence/test_postgres_pc6_federated_recovery.py
       - name: Run real multidomain recurring recovery integration
         run: python -m pytest -q tests/e2e/sose/persistence/test_postgres_pc6_full_real_domain_recovery.py
-      - name: Verify eleven real-domain and boundary restart certificates
+      - name: Verify twenty-three real-domain and boundary restart certificates
         run: |
           python - <<'PY'
           import json
@@ -557,8 +557,8 @@ jobs:
           cases = report["cases"]
           assert report["protocol"] == "pc6-real-multidomain-recurring-v3"
           assert report["canonical_truth_schema_version"] == 1
-          assert len(cases) == 11, f"expected eleven real worker-death windows; got {len(cases)}"
-          assert len({case["fault"] for case in cases}) == 11
+          assert len(cases) == 23, f"expected twenty-three real worker-death windows; got {len(cases)}"
+          assert len({case["fault"] for case in cases}) == 23
           assert report["all_equivalent"]
           required = {
               "semantic_digest", "typed_edges", "boundary_causal_edges",
