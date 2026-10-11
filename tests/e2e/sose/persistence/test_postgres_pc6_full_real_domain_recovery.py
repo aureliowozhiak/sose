@@ -258,6 +258,7 @@ def _run(dsn, *, killed=False, cut="after_logistics_effect"):
 _KILL_PROCESS = """
 import os, sys
 from datetime import timedelta
+from sose.composition.effects import BusinessEffectService
 from sose.composition.recovery import TradingCustomerRecoveryRunner
 from sose.composition.scheduler import RecoverySchedule
 from sose.core.resource_identity import ResourcePoolContract
