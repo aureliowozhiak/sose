@@ -163,3 +163,31 @@ def test_causal_predecessors_precede_effects_and_physical_intervals_never_overla
         intervals.sort()
         assert all(a[1] <= b[0] for a, b in zip(intervals, intervals[1:]))
     assert state["done"] and not reservations
+
+
+def test_durable_identity_does_not_alias_colon_bearing_item_station_pairs(tmp_path):
+    from dataclasses import replace
+
+    base = _arms()["baseline"]
+    raw = base.model.canonical_payload()
+    raw["stations"] = {"c": {}, "b:c": {}, "root": {}}
+    raw["routing"] = {"dependency_edges": [["c", "root"], ["b:c", "root"]]}
+    arm = replace(base, model=ModelSpec.model_validate(raw))
+    work = tuple(
+        OD5aWorkItem(
+            item_id=i, arrival_at=0.0,
+            service_by_station=(("c", 1.0), ("b:c", 1.0), ("root", 1.0)),
+        ) for i in ("a:b", "a")
+    )
+    path = tmp_path / "ambiguous_ids.db"
+    with SQLitePersistence(path) as store:
+        initialize_od5a_durable(store, job_id="j:1", arm=arm, items=work)
+        for _ in range(100):
+            if not advance_od5a_durable(store, job_id="j:1"):
+                break
+        state = od5a_durable_state(store, job_id="j:1")
+        events = od5a_durable_events(store, job_id="j:1")
+        assert state["done"]
+        assert set(state["completed"]) == {"a:b", "a"}
+        assert len({e.event_id for e in events}) == len(events)
+        assert not store.resource_reservations()
