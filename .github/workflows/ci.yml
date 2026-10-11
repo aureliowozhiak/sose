@@ -433,6 +433,7 @@ jobs:
         run: |
           python -m pytest -q \
             tests/e2e/sose/persistence/test_postgres_infrastructure_chaos.py \
+            tests/e2e/sose/persistence/test_postgres_pc6_uncertain_ack_commit.py \
             --junitxml=chaos-postgres-infrastructure.xml
 
       - name: Upload PostgreSQL infrastructure chaos report
