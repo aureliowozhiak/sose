@@ -539,7 +539,7 @@ def _seed_before_logistics_ack(dsn, ns):
 _KILL_REAL_BOUNDARY_PROCESS = """
 import os, sys
 from datetime import timedelta
-from sose.composition.boundary import BoundaryService
+from sose.composition.boundary import BoundaryConsumerRegistry, BoundaryService
 from sose.composition.recovery import TradingCustomerRecoveryRunner
 from sose.composition.scheduler import RecoverySchedule
 from sose.core.resource_identity import ResourcePoolContract
@@ -550,7 +550,7 @@ dsn, domain_ns, physical_ns, correlation, cut = sys.argv[1:]
 original_claim = BoundaryService.claim_next
 original_consume = BoundaryService.consume
 def claimed(self, **kwargs):
-    if cut == "after_claim" and kwargs.get("destination_domain") == "logistics":
+    if cut in ("after_claim", "inside_ack") and kwargs.get("destination_domain") == "logistics":
         # Expire the dead worker's *physical* lease before its logical replay.
         # The later recovered ACK still uses the reference slot's logical time.
         kwargs = dict(kwargs)
@@ -561,6 +561,26 @@ def claimed(self, **kwargs):
         os._exit(79)
     return lease
 def consumed(self, *, lease, registry, now):
+    if cut == "inside_ack":
+        with self._transaction() as uow:
+            message = uow.get_boundary_message(lease.message_id)
+        assert message is not None and message.contract_key == "warehouse.dispatch_ready.v1"
+        original_handler = registry.resolve(message)
+        killing_registry = BoundaryConsumerRegistry()
+        def kill_during_ack(inbound, uow):
+            effect_id = original_handler(inbound, uow)
+            assert uow.get_command(effect_id) is not None
+            os._exit(79)  # Command staged, ACK and Command not committed.
+        killing_registry.register(
+            destination_domain=message.destination_domain,
+            contract_name=message.contract_name,
+            contract_version=message.contract_version,
+            handler=kill_during_ack,
+        )
+        return original_consume(
+            self, lease=lease, registry=killing_registry,
+            now=now - timedelta(hours=2),
+        )
     receipt = original_consume(self, lease=lease, registry=registry, now=now)
     if cut == "after_ack" and receipt is not None:
         assert self.persistence.command(receipt.consumer_effect_id) is not None
@@ -616,7 +636,7 @@ def _run_real_boundary_cut(dsn, *, cut=None):
             delivery = BoundaryService(dead).delivery(seeded["a"][2])
             assert delivery is not None
             assert delivery.status is (
-                DeliveryStatus.CLAIMED if cut == "after_claim"
+                DeliveryStatus.CLAIMED if cut in {"after_claim", "inside_ack"}
                 else DeliveryStatus.CONSUMED
             )
             if cut == "after_ack":
@@ -645,7 +665,7 @@ def _run_real_boundary_cut(dsn, *, cut=None):
     return _proof(dsn, domains, physical_ns, seeds)
 
 
-@pytest.mark.parametrize("cut", ("after_claim", "after_ack"))
+@pytest.mark.parametrize("cut", ("after_claim", "inside_ack", "after_ack"))
 def test_pg_real_logistics_boundary_worker_death_preserves_recurring_slot(cut):
     """Real ACK/Command and four subsequent real statecharts; no reference terminal states."""
     assert DSN is not None
