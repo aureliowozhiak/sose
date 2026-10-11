@@ -357,3 +357,325 @@ def test_pg_two_equal_value_pc6_flows_converge_after_independent_worker_deaths(t
         Path(destination).parent.mkdir(parents=True, exist_ok=True)
         Path(destination).write_text(evidence, encoding="utf-8")
     assert recovered == baseline
+
+
+# PC6 protocol falsification: unlike the older injected exception/connection
+# restarts above, these cuts really kill the child interpreter by os._exit.
+# The two organizations intentionally own independent operational namespaces;
+# only their fully committed semantic histories are compared.
+def _seed_independent_organization(store, flow):
+    from sose.domain.entity import Entity
+
+    with store.transaction() as uow:
+        for kind, initial in (
+            ("shipment", "created"), ("sales_order", "submitted"),
+            ("card_payment", "authorization_requested"),
+            ("journal_entry", "drafted"),
+        ):
+            uow.save_entity(Entity(
+                id=_entity_id(flow, kind), entity_type=kind, state=initial,
+                attributes={"amount": 250.0, "currency": "USD"},
+            ))
+    SettlementBindingService(store).bind(CustomerSettlementBinding.create(
+        order_id=f"order-{flow}", payment_id=f"payment-{flow}",
+        journal_id=f"journal-{flow}", amount=250.0, currency="USD",
+        correlation_id=f"pc6-flow-{flow}",
+    ))
+
+
+def _org_messages(flow):
+    messages = []
+    for stage in range(len(STAGES)):
+        messages.append(_message(
+            flow, stage, messages[-1] if messages else None,
+        ))
+    return tuple(messages)
+
+
+def _run_org_boundary_stage(store, flow, stage, *, cut=None, replay=False):
+    """Exactly the same durable protocol for baseline, fatal child and replay.
+
+    A pending delivery's claim lease expires before the new process reclaims;
+    a consumed delivery is not re-claimed. Domain reference events and their
+    immutable business certificates are replay-safe independent of workers.
+    """
+    from sose.composition.model import BoundaryDelivery
+
+    message = _org_messages(flow)[stage]
+    service = BoundaryService(store)
+    existing = service.publish(message)
+    assert existing.message_id == message.message_id
+    if cut == "after_publish":
+        os._exit(79)
+
+    delivery = service.delivery(existing.delivery_id)
+    assert delivery is not None
+    if delivery.status is not DeliveryStatus.CONSUMED:
+        # Killed claims were for two seconds; recovery starts at +3s. The
+        # original lease token is never reused across the real process death.
+        at = message.produced_at + (timedelta(seconds=3) if replay else timedelta(0))
+        lease = service.claim_next(
+            owner_id="recovery-" + flow if replay else "first-" + flow,
+            now=at, lease_duration=timedelta(seconds=2),
+            destination_domain=message.destination_domain,
+            accepted_contracts=frozenset({(
+                message.contract_name, message.contract_version,
+            )}),
+            message_id=message.message_id,
+        )
+        assert lease is not None, (flow, stage, cut, delivery)
+        if replay and delivery.status is DeliveryStatus.CLAIMED:
+            assert lease.epoch == delivery.claim_epoch + 1
+        if cut == "after_claim":
+            os._exit(79)
+
+        registry = _registry()
+        if cut == "inside_ack_before_commit":
+            # The actual consumer constructs the actual staged Command in
+            # the PostgreSQL UoW; terminate the *process* before COMMIT.
+            handler = registry.resolve(message)
+            registry = BoundaryConsumerRegistry()
+
+            def kill_between_command_and_ack_commit(inbound, uow):
+                effect = handler(inbound, uow)
+                assert uow.get_command(effect) is not None
+                os._exit(79)
+
+            registry.register(
+                destination_domain=message.destination_domain,
+                contract_name=message.contract_name,
+                contract_version=message.contract_version,
+                handler=kill_between_command_and_ack_commit,
+            )
+        consumption = service.consume(lease=lease, registry=registry, now=at)
+        assert consumption.consumer_effect_id == _effect_id(message)
+        assert store.command(_effect_id(message)) is not None
+        if cut == "after_ack_command":
+            os._exit(79)
+    else:
+        consumed = service.consumption(delivery.delivery_id)
+        assert consumed is not None
+        assert consumed.consumer_effect_id == _effect_id(message)
+
+    if store.command(_effect_id(message)) is not None:
+        _apply_once(store, message)
+        if cut == "after_domain_transition":
+            assert store.command(_effect_id(message)) is not None
+            os._exit(79)
+    else:
+        assert any(
+            proof.effect_id == _effect_id(message)
+            for proof in store.business_effects()
+        ), "missing pending Command without an immutable certificate"
+
+    proof = _certify(store, message)
+    assert proof.effect_id == _effect_id(message)
+    assert store.command(_effect_id(message)) is None
+    if cut == "after_certificate":
+        os._exit(79)
+    # Repeating the final receipt never mutates the committed effect.
+    assert _certify(store, message) == proof
+
+
+def _independent_org_view(store, flow):
+    """Compare full durable causal facts, never transient lease metadata."""
+    proof = audit_causal_history(store)
+    with store.boundary_transaction() as uow:
+        deliveries = tuple(sorted(
+            uow.boundary_deliveries(), key=lambda d: d.message_id,
+        ))
+        assert len(deliveries) == len(STAGES)
+        assert all(d.status is DeliveryStatus.CONSUMED for d in deliveries)
+        messages = tuple(
+            uow.get_boundary_message(d.message_id) for d in deliveries
+        )
+        consumption_ids = tuple(
+            (d.message_id, uow.get_boundary_consumption(d.delivery_id).consumption_id,
+             uow.get_boundary_consumption(d.delivery_id).consumer_effect_id)
+            for d in deliveries
+        )
+        assert all(
+            uow.get_command(_effect_id(m)) is None for m in messages
+        )
+    def canonical(values):
+        return tuple(sorted(json.dumps(
+            asdict(item), default=str, sort_keys=True, separators=(",", ":"),
+        ) for item in values))
+    binding = SettlementBindingService(store).for_order(f"order-{flow}")
+    assert binding is not None
+    assert proof.message_count == proof.applied_effects == len(STAGES)
+    assert proof.pending_effects == 0
+    assert len(proof.typed_edges) == len(STAGES) - 1
+    return {
+        "organization": flow, "semantic_digest": proof.semantic_digest,
+        "typed_edges": proof.typed_edges,
+        "messages": canonical(messages),
+        "delivery_truth": tuple(
+            (d.delivery_id, d.message_id, d.status.value, d.consumer_effect_id)
+            for d in deliveries
+        ),
+        "consumptions": consumption_ids,
+        "entities": canonical(store.entities()),
+        "events": canonical(store.events()),
+        "certificates": canonical(store.business_effects()),
+        "bindings": asdict(binding),
+        "scheduled": canonical(store.scheduled_work()),
+        "resources": canonical(store.resource_reservations()),
+        "store_items": canonical(store.store_items()),
+        "container_states": canonical(store.container_states()),
+        "jobs": canonical(store.job_states()),
+        "sink_checkpoints": canonical(store.sink_checkpoints()),
+    }
+
+
+def _run_oskill_case(stage, *, cut=None):
+    from sose.composition.model import BoundaryDelivery
+
+    assert DSN is not None
+    namespaces = {
+        flow: "pc6os_" + flow + "_" + uuid4().hex[:12]
+        for flow in FLOWS
+    }
+    for flow in FLOWS:
+        with PostgresPersistence(DSN, namespace=namespaces[flow]) as store:
+            _seed_independent_organization(store, flow)
+    for previous in range(stage):
+        for flow in FLOWS:
+            with PostgresPersistence(DSN, namespace=namespaces[flow]) as store:
+                _run_org_boundary_stage(store, flow, previous)
+
+    if cut is not None:
+        import subprocess
+        import sys
+
+        child = subprocess.run([
+            sys.executable, str(Path(__file__).resolve()),
+            "--pc6-oskill-worker", DSN, namespaces["a"], "a",
+            str(stage), cut,
+        ], capture_output=True, text=True, timeout=90, check=False)
+        assert child.returncode == 79, (
+            stage, cut, child.returncode, child.stderr[-3000:],
+        )
+        with PostgresPersistence(DSN, namespace=namespaces["a"]) as interrupted:
+            current = _org_messages("a")[stage]
+            delivery = BoundaryService(interrupted).delivery(
+                BoundaryDelivery.pending(current).delivery_id
+            )
+            assert delivery is not None
+            if cut in {"after_publish", "after_claim", "inside_ack_before_commit"}:
+                assert interrupted.command(_effect_id(current)) is None
+                assert BoundaryService(interrupted).consumption(
+                    delivery.delivery_id
+                ) is None
+            if cut == "inside_ack_before_commit":
+                assert delivery.status is DeliveryStatus.CLAIMED
+            if cut in {"after_ack_command", "after_domain_transition"}:
+                assert interrupted.command(_effect_id(current)) is not None
+            if cut == "after_certificate":
+                assert interrupted.command(_effect_id(current)) is None
+                assert any(
+                    certificate.effect_id == _effect_id(current)
+                    for certificate in interrupted.business_effects()
+                )
+
+            # An explicitly typed causal child can already be published, but
+            # it MUST NOT be claimable before the predecessor's actual
+            # BusinessEffectApplied certificate. Other orgs do not wait.
+            if stage < len(STAGES) - 1 and cut != "after_certificate":
+                descendant = _org_messages("a")[stage + 1]
+                boundary = BoundaryService(interrupted)
+                boundary.publish(descendant)
+                assert boundary.claim_next(
+                    owner_id="premature-descendant", now=descendant.produced_at,
+                    lease_duration=timedelta(minutes=1),
+                    destination_domain=descendant.destination_domain,
+                    message_id=descendant.message_id,
+                ) is None, (stage, cut, "causal overtaking")
+
+        # Organization B advances through ALL remaining domains while A's
+        # process is *dead*, proving no global sequence/barrier across orgs.
+        with PostgresPersistence(DSN, namespace=namespaces["b"]) as independent:
+            for following in range(stage, len(STAGES)):
+                _run_org_boundary_stage(independent, "b", following)
+            assert len(independent.business_effects()) == len(STAGES)
+        with PostgresPersistence(DSN, namespace=namespaces["a"]) as restarted:
+            for following in range(stage, len(STAGES)):
+                _run_org_boundary_stage(
+                    restarted, "a", following, replay=(following == stage),
+                )
+    else:
+        for following in range(stage, len(STAGES)):
+            for flow in FLOWS:
+                with PostgresPersistence(DSN, namespace=namespaces[flow]) as store:
+                    _run_org_boundary_stage(store, flow, following)
+
+    view = {}
+    for flow in FLOWS:
+        # Inspect only freshly opened connections: no in-memory worker state
+        # survives the child's os._exit(79).
+        with PostgresPersistence(DSN, namespace=namespaces[flow]) as store:
+            view[flow] = _independent_org_view(store, flow)
+    return view
+
+
+def test_pg_real_worker_death_across_all_multidomain_boundary_commit_windows(tmp_path):
+    """Four causal domains x six process death windows x two independent orgs."""
+    from hashlib import sha256
+
+    cases = []
+    for stage, contract in enumerate(STAGES):
+        continuous = _run_oskill_case(stage)
+        baseline = json.dumps(continuous, sort_keys=True, default=str)
+        reference_digest = sha256(baseline.encode("utf-8")).hexdigest()
+        for cut in (
+            "after_publish", "after_claim", "inside_ack_before_commit",
+            "after_ack_command", "after_domain_transition", "after_certificate",
+        ):
+            recovered = _run_oskill_case(stage, cut=cut)
+            serialized = json.dumps(recovered, sort_keys=True, default=str)
+            assert recovered == continuous, (
+                f"cross-org typed causal DAG differs at {contract[0]}: {cut}"
+            )
+            cases.append({
+                "contract": contract[0], "fault": cut,
+                "worker_exit_code": 79,
+                "reference_digest_sha256": reference_digest,
+                "recovered_digest_sha256": sha256(serialized.encode("utf-8")).hexdigest(),
+                "equal": recovered == continuous,
+                "typed_edges_per_organization": len(recovered["a"]["typed_edges"]),
+                "effects_per_organization": len(STAGES),
+            })
+
+    report = {
+        "protocol": "pc6-multidomain-real-oskill-boundary-v1",
+        "organizations": list(FLOWS),
+        "contracts": [stage[0] for stage in STAGES],
+        "termination": "os._exit(79) in an isolated subprocess",
+        "reference_domain_execution": "durable deterministic reference transitions; not live domain statecharts",
+        "windows": cases,
+        "all_equivalent": all(c["equal"] for c in cases),
+    }
+    output = Path(os.environ.get(
+        "SOSE_PC6_MULTIDOMAIN_OSKILL_REPORT",
+        str(tmp_path / "pc6-multidomain-oskill.json"),
+    ))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8",
+    )
+    assert len(cases) == len(STAGES) * 6
+
+
+def _oskill_child_entry():
+    import sys
+
+    if len(sys.argv) != 7 or sys.argv[1] != "--pc6-oskill-worker":
+        raise SystemExit("invalid isolated PC6 worker invocation")
+    _, _, dsn, namespace, flow, stage, cut = sys.argv
+    with PostgresPersistence(dsn, namespace=namespace) as store:
+        _run_org_boundary_stage(store, flow, int(stage), cut=cut)
+    raise AssertionError("worker unexpectedly survived the requested fatal window")
+
+
+if __name__ == "__main__":
+    _oskill_child_entry()
