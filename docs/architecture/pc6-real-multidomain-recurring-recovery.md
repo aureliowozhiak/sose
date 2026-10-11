@@ -32,6 +32,14 @@ The first real O2C post-certificate worker-death falsification uncovered a one-s
 
 `SimulationJobState.active_effect_ids` now records immutable **unmapped** business Command IDs in the job's fenced UoW **before** executing the actual statechart. An interrupted recurrence reconstructs this set, checks the original durable ACK and terminal `BusinessEffectApplied` certificate, and debits already committed effects from that same slot's bounded action budget. If the Command remains pending, it is retried without charging completed work; if both Command and certificate are absent, recovery fails closed. Successfully completed triggers clear the enrollment atomically with the checkpoint. Mapped Logistics effects remain accounted for by the authoritative physical ledger; no synthetic physical reservations are added to O2C, Payments or R2R to hide a scheduler bug.
 
+### Expanded executable OS-kill cuts and causal audit
+
+The combined PostgreSQL falsifier now terminates actual processes in **eight distinct cases**: after Logistics certification and before physical release; after O2C, Cards Payments and R2R certification but before the original recurring checkpoint; and **before** the immutable business-effect certificate for each of Logistics, O2C, Payments and R2R (after the respective real domain statechart already committed its terminal entity/event). The oracle compares each to its own continuous reference across two independent organizations, preserves the entire authoritative courier ledger and all job checkpoint identities, and rejects even a one-slot advancement caused by recovered work.
+
+The required `pc6-real-multidomain.json` bundle uses protocol `pc6-real-multidomain-recurring-v2` with exactly eight named cases, SHA-256 digests, per-organization certificate cardinality, and an aggregate equivalence flag. CI validates every case before publishing the artifact.
+
+**Causal-link boundary:** The legacy Trading Company reference producer retains a real `causation_id` predecessor for the seven inter-domain boundaries but some messages still lack the opt-in `causation_kind="boundary"` discriminator. The test audits all seven exact predecessor identities, correlations, and logical-time ordering, and preserves the typed audit edges that actually exist; **this is not evidence that every legacy message has been migrated to the stronger typed protocol**.
+
 **Required artifact:** `pc6-real-multidomain.json` on PostgreSQL CI. It contains canonical hashes of reference and recovered runs.
 
 ## ADR: staged promotion, not a blanket distributed exactly-once claim
