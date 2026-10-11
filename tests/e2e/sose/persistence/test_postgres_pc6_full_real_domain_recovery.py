@@ -140,7 +140,8 @@ def _advance(dsn, ns, shared_ns, org, corr, *, max_ticks=18):
 
 
 def _canonical_objects(items):
-    return tuple(sorted(
+    """Stable ordering, with actual structured records available to scientific reviewers."""
+    return tuple(json.loads(encoded) for encoded in sorted(
         json.dumps(asdict(x), default=str, sort_keys=True, separators=(",", ":"))
         for x in items
     ))
@@ -221,8 +222,11 @@ def _proof(dsn, domains, physical_ns, seeds):
                 "stores": _canonical_objects(store.store_items()),
                 "containers": _canonical_objects(store.container_states()),
                 "sinks": _canonical_objects(store.sink_checkpoints()),
-                "position": store.simulation_position(),
-                "job_state": state,
+                "position": (
+                    asdict(position) if (position := store.simulation_position()) is not None
+                    else None
+                ),
+                "job_state": asdict(state),
             }
     return {"organizations": evidence, "physical": ledger}
 
@@ -348,7 +352,8 @@ def _record_equivalence(name, baseline, recovered, *, default_path=None):
     report = (
         json.loads(destination.read_text(encoding="utf-8"))
         if destination.exists() else {
-            "protocol": "pc6-real-multidomain-recurring-v2",
+            "protocol": "pc6-real-multidomain-recurring-v3",
+            "canonical_truth_schema_version": 1,
             "organizations": ["a", "b"],
             "real_domain_handlers": list(DOMAINS),
             "physical_pool": "pickup_courier/shared/pc6-real-crossdomain/capacity-1",
@@ -363,6 +368,10 @@ def _record_equivalence(name, baseline, recovered, *, default_path=None):
         "equivalent": baseline == recovered,
         "reference_sha256": sha256(reference.encode()).hexdigest(),
         "recovered_sha256": sha256(replay.encode()).hexdigest(),
+        # Keep the entire normalized truth, not just digests. Every field
+        # used by the equivalence oracle is thus independently inspectable.
+        "reference_truth": json.loads(reference),
+        "recovered_truth": json.loads(replay),
         "certificates_per_organization": {
             org: len(baseline["organizations"][org]["certificates"])
             for org in ("a", "b")
