@@ -31,6 +31,8 @@ def test_od5a_design_has_finite_arms_comparators_and_no_confirmatory_execution()
     assert plan["primary"]["practical_improvement_fraction"] == -0.05
     assert plan["primary"]["throughput_ratio_minimum"] == 0.98
     assert plan["analysis"]["multiplicity"].startswith("Holm")
+    assert plan["analysis"]["primary_family_size"] == 3 * 7
+    assert plan["analysis"]["resampling_unit"].startswith("Sobol structural stratum")
 
 
 def test_od5a_prospective_regimes_do_not_depend_on_post_treatment_outcomes() -> None:
