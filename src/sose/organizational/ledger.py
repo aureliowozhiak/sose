@@ -169,15 +169,25 @@ class ActorLedger(BaseModel):
     def validate_capacity(self) -> "ActorLedger":
         ordered = tuple(sorted(self.intervals, key=lambda interval: (interval.start, interval.end)))
         object.__setattr__(self, "intervals", ordered)
-        for previous, current in zip(ordered, ordered[1:], strict=False):
-            if previous.config_epoch is None or current.config_epoch is None:
-                continue
-            if current.start < previous.end and current.config_epoch != previous.config_epoch:
-                raise ValueError("actor capacity spans conflicting config epochs")
-            if current.start >= previous.end and current.config_epoch < previous.config_epoch:
-                raise ValueError("actor config_epoch cannot regress")
-            if current.config_epoch == previous.config_epoch and current.model_spec_hash != previous.model_spec_hash:
+        # Fractionally allocated actor intervals may nest: comparing only
+        # adjacent sorted intervals misses long-lived allocations spanning
+        # multiple configuration revisions.
+        committed_epochs: dict[int, str] = {}
+        for index, current in enumerate(ordered):
+            if current.config_epoch is None:
+                continue  # Older historical actor ledgers have no epoch evidence.
+            previous_hash = committed_epochs.setdefault(
+                current.config_epoch, current.model_spec_hash,
+            )
+            if previous_hash != current.model_spec_hash:
                 raise ValueError("same actor config_epoch cannot change ModelSpec identity")
+            for previous in ordered[:index]:
+                if previous.config_epoch is None:
+                    continue
+                if current.start < previous.end and current.config_epoch != previous.config_epoch:
+                    raise ValueError("actor capacity spans conflicting config epochs")
+                if current.start >= previous.end and current.config_epoch < previous.config_epoch:
+                    raise ValueError("actor config_epoch cannot regress")
         if self.fractional_multitasking:
             self._validate_fractional_capacity()
         else:
