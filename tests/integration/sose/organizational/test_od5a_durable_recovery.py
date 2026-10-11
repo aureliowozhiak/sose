@@ -285,3 +285,43 @@ def test_durable_rejects_coordination_below_datetime_resolution(tmp_path):
         with pytest.raises(ValueError, match="microsecond"):
             initialize_od5a_durable(store, job_id="precision", arm=invalid, items=_items())
         assert store.entity("od5a_durable_pilot", "precision") is None
+
+
+@pytest.mark.parametrize("arm_id", [
+    "baseline", "capacity_only", "topology_only",
+    "coordination_only", "structural_combined",
+])
+def test_fractional_exact_microseconds_match_simpy_after_addition(tmp_path, arm_id):
+    """Valid 0.1 + 0.2 must finish at exactly 0.3, not persisted binary noise."""
+    from sose.organizational.od5a_mechanisms import run_od5a_pilot
+
+    arm = _arms()[arm_id]
+    work = (
+        OD5aWorkItem("fractional", 0.1, (("a", 0.2), ("b", 0.2), ("c", 0.2))),
+        OD5aWorkItem("next", 0.3, (("a", 0.1), ("b", 0.1), ("c", 0.1))),
+    )
+    expected = run_od5a_pilot(arm=arm, items=work, horizon=100.0)
+    with SQLitePersistence(tmp_path / "fractional.db") as store:
+        initialize_od5a_durable(store, job_id="fractional", arm=arm, items=work)
+        for _ in range(100):
+            if not advance_od5a_durable(store, job_id="fractional"):
+                break
+        else:
+            pytest.fail("fractional world did not terminate")
+        state = od5a_durable_state(store, job_id="fractional")
+        events = od5a_durable_events(store, job_id="fractional")
+        actual = sorted((
+            e.payload["kind"], e.payload["item_id"],
+            e.payload["source"], e.payload["target"],
+            e.payload["start"], e.payload["end"], e.payload["resource"],
+        ) for e in events if e.payload["kind"] != "arrival")
+        expected_trace = sorted((
+            e.kind, e.item_id, e.source, e.target, e.start, e.end,
+            e.resource_instance,
+        ) for e in expected.events)
+        assert state["completed"] == dict(expected.completed_at)
+        assert actual == expected_trace
+        assert all(
+            round(e.payload["end"] * 1_000_000) == e.payload["end"] * 1_000_000
+            for e in events
+        )
