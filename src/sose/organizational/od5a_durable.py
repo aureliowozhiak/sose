@@ -9,8 +9,10 @@ This is NOT the confirmatory OD-5a execution engine or independent freeze.
 from __future__ import annotations
 
 from copy import deepcopy
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from math import isfinite
 import json
 from typing import Any
 
@@ -26,6 +28,13 @@ from .od5a_mechanisms import OD5aWorkItem
 
 _ORIGIN = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _KIND = "od5a_durable_pilot"
+
+
+def _precise_time(value: float | int, label: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+        raise ValueError(f"{label} requires a finite numeric time")
+    if Decimal(str(value)) * 1_000_000 != (Decimal(str(value)) * 1_000_000).to_integral_value():
+        raise ValueError(f"{label} must have exact microsecond resolution")
 
 
 def _time(offset: float) -> datetime:
@@ -252,6 +261,14 @@ def initialize_od5a_durable(
         raise ValueError("physical slots must be positive integers")
     coordination_latency = float(arm.model.parameters["coordination_latency"])
     transition = 0.0 if arm.charged_cost is None else arm.charged_cost.transition_time
+    if coordination_latency < 0 or transition < 0:
+        raise ValueError("pilot coordination and transition intervals must be nonnegative")
+    _precise_time(coordination_latency, "coordination latency")
+    _precise_time(transition, "transition time")
+    for item in items:
+        _precise_time(item.arrival_at, "arrival time")
+        for _, duration in item.service_by_station:
+            _precise_time(duration, "service duration")
     workload = [
         {"item": item.item_id, "at": item.arrival_at,
          "service": [list(pair) for pair in item.service_by_station]}
