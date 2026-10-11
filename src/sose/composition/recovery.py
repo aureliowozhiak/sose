@@ -260,6 +260,41 @@ class TradingCustomerRecoveryRunner:
             # that certified non-resource effect to its original occurrence.
             # Mapped effects are instead charged by the physical ledger below.
             if current_job is not None:
+                # ACK+Command is one transaction, but is a separate bounded
+                # scheduling action from executing that Command. A worker
+                # killed after ACK must not apply the domain in the same slot.
+                for message_id in current_job.active_boundary_message_ids:
+                    matches = tuple(
+                        delivery for delivery in uow.boundary_deliveries()
+                        if delivery.message_id == message_id
+                    )
+                    if len(matches) != 1:
+                        raise RuntimeError(
+                            "enrolled recovery ACK lost its durable delivery"
+                        )
+                    delivery = matches[0]
+                    if delivery.status is DeliveryStatus.CONSUMED:
+                        receipt = uow.get_boundary_consumption(delivery.delivery_id)
+                        if (
+                            receipt is None
+                            or receipt.consumer_effect_id != delivery.consumer_effect_id
+                            or uow.get_boundary_message(message_id) is None
+                        ):
+                            raise RuntimeError(
+                                "enrolled recovery ACK lost its atomic Command receipt"
+                            )
+                        if (
+                            uow.get_command(receipt.consumer_effect_id) is None
+                            and uow.get_business_effect(receipt.consumer_effect_id) is None
+                        ):
+                            raise RuntimeError(
+                                "recovery ACK has neither pending Command nor certificate"
+                            )
+                        actions += 1
+                    elif uow.get_boundary_consumption(delivery.delivery_id) is not None:
+                        raise RuntimeError(
+                            "unconsumed enrolled delivery has a committed ACK"
+                        )
                 for effect_id in current_job.active_effect_ids:
                     certificate = uow.get_business_effect(effect_id)
                     command = uow.get_command(effect_id)
@@ -496,6 +531,22 @@ class TradingCustomerRecoveryRunner:
                 message = uow.get_boundary_message(lease.message_id)
             if message is None:
                 raise RuntimeError("claimed WM boundary message disappeared")
+            # Enroll before the ACK transaction, not afterward: an actual
+            # OS-kill between COMMIT and the next Python statement must leave
+            # sufficient evidence to charge this exact scheduled occurrence.
+            # An uncommitted ACK is not charged and can be reclaimed safely.
+            if active_trigger is not None:
+                with store.transaction() as uow:
+                    job = uow.get_job_state(self.job_id)
+                    if job is None or job.active_trigger_id != active_trigger:
+                        raise RuntimeError("recovery ACK lost its active trigger")
+                    if lease.message_id not in job.active_boundary_message_ids:
+                        uow.save_job_state(replace(
+                            job,
+                            active_boundary_message_ids=(
+                                *job.active_boundary_message_ids, lease.message_id,
+                            ),
+                        ))
             service.consume(
                 lease=lease, registry=self._registry_for(message), now=now,
             )
@@ -544,8 +595,10 @@ class TradingCustomerRecoveryRunner:
                 raise ValueError("composition trigger cannot rewind durable logical time")
             if current.active_trigger_id not in (None, trigger_id):
                 raise RuntimeError("another recovery occurrence is still active")
-            if current.active_trigger_id is None and current.active_effect_ids:
-                raise RuntimeError("completed recovery job has orphaned effect enrollment")
+            if current.active_trigger_id is None and (
+                current.active_effect_ids or current.active_boundary_message_ids
+            ):
+                raise RuntimeError("completed recovery job has orphaned work enrollment")
             uow.save_job_state(replace(
                 current,
                 status="running",
@@ -581,6 +634,7 @@ class TradingCustomerRecoveryRunner:
                 phase="idle",
                 active_trigger_id=None,
                 active_effect_ids=(),
+                active_boundary_message_ids=(),
                 last_completed_trigger_id=trigger_id,
                 completed_batch_triggers=(
                     *current.completed_batch_triggers, completed_record,
