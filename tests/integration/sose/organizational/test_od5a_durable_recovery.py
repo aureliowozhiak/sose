@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from sose.organizational.model_spec import EvidenceClass, ModelSpec
-from sose.organizational.od5a_admission import OD5aChargedCost, compile_od5a_arms
+from sose.organizational.od5a_admission import OD5aChargedCost, OD5aCompiledArm, compile_od5a_arms
 from sose.organizational.od5a_mechanisms import OD5aWorkItem
 from sose.organizational.od5a_durable import (
     advance_od5a_durable, initialize_od5a_durable, od5a_durable_state,
@@ -166,13 +166,11 @@ def test_causal_predecessors_precede_effects_and_physical_intervals_never_overla
 
 
 def test_durable_identity_does_not_alias_colon_bearing_item_station_pairs(tmp_path):
-    from dataclasses import replace
-
     base = _arms()["baseline"]
     raw = base.model.canonical_payload()
     raw["stations"] = {"c": {}, "b:c": {}, "root": {}}
     raw["routing"] = {"dependency_edges": [["c", "root"], ["b:c", "root"]]}
-    arm = replace(base, model=ModelSpec.model_validate(raw))
+    arm = OD5aCompiledArm("baseline", ModelSpec.model_validate(raw), None, None)
     work = tuple(
         OD5aWorkItem(
             item_id=i, arrival_at=0.0,
