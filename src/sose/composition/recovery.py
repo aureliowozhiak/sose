@@ -252,21 +252,59 @@ class TradingCustomerRecoveryRunner:
         # before the job checkpoint must not make that slot appear empty.
         with store.transaction() as uow:
             current_job = uow.get_job_state(self.job_id)
-        active_trigger = (
-            current_job.active_trigger_id if current_job is not None else None
-        )
+            active_trigger = (
+                current_job.active_trigger_id if current_job is not None else None
+            )
+            # An accepted Command can commit its business certificate and then
+            # lose the worker *before* the recurring trigger checkpoint. Charge
+            # that certified non-resource effect to its original occurrence.
+            # Mapped effects are instead charged by the physical ledger below.
+            if current_job is not None:
+                for effect_id in current_job.active_effect_ids:
+                    certificate = uow.get_business_effect(effect_id)
+                    command = uow.get_command(effect_id)
+                    if certificate is None:
+                        if command is None:
+                            raise RuntimeError(
+                                "enrolled recovery effect lacks Command and certificate"
+                            )
+                        continue
+                    if command is not None:
+                        raise RuntimeError(
+                            "enrolled recovery effect has certificate and pending Command"
+                        )
+                    if certificate.effect_id != effect_id:
+                        raise RuntimeError("recovery certificate changed effect identity")
+                    deliveries = tuple(
+                        d for d in uow.boundary_deliveries()
+                        if d.message_id == certificate.boundary_message_id
+                    )
+                    if len(deliveries) != 1:
+                        raise RuntimeError("certified recovery effect lost causal boundary")
+                    consumption = uow.get_boundary_consumption(deliveries[0].delivery_id)
+                    if (
+                        consumption is None
+                        or consumption.consumer_effect_id != effect_id
+                    ):
+                        raise RuntimeError("certified recovery effect lacks original ACK")
+                    actions += 1
+            if actions > self.max_actions:
+                raise RuntimeError("committed recovery actions exceed trigger budget")
         # Reconcile a crash after immutable domain certification but before
         # release of its authoritative temporal reservation.
-        if resource_intents is not None:
+        if resource_intents is not None and actions < self.max_actions:
             # A recovered release is a committed physical/causal action, not
             # free extra work. Otherwise a resumed occurrence may emit the
             # NEXT boundary effect one slot earlier than uninterrupted replay.
             actions += resource_intents.reconcile_certified(
-                store, self.resource_organizations, max_completed=self.max_actions,
+                store, self.resource_organizations,
+                max_completed=self.max_actions - actions,
                 trigger_id=active_trigger,
             )
             if actions >= self.max_actions:
                 return actions
+        if actions >= self.max_actions:
+            return actions
         # A deferred effect stays durable, but must not monopolize this tick.
         deferred_this_tick: set[str] = set()
         for _ in range(self.max_actions):
@@ -278,10 +316,10 @@ class TradingCustomerRecoveryRunner:
             ]
             if pending:
                 source, effect_id = pending[0]
+                command = store.command(effect_id)
+                if command is None:
+                    raise RuntimeError("accepted effect disappeared before execution")
                 if resource_intents is not None:
-                    command = store.command(effect_id)
-                    if command is None:
-                        raise RuntimeError("accepted effect disappeared before resource admission")
                     demand_due = command.due_at
                     if (
                         command.name == "composition.deliver_shipment"
@@ -302,6 +340,25 @@ class TradingCustomerRecoveryRunner:
                     if not admitted:
                         deferred_this_tick.add(effect_id)
                         continue
+                # Every non-physical business action is durably enrolled in
+                # the owning trigger BEFORE the real domain transition. On
+                # restart its immutable certificate consumes the same slot.
+                # Resource-mapped actions already have an authoritative
+                # admission-to-trigger link in the physical PostgreSQL ledger.
+                if (
+                    active_trigger is not None
+                    and (self.resource_policies is None
+                         or command.name not in self.resource_policies)
+                ):
+                    with store.transaction() as uow:
+                        job = uow.get_job_state(self.job_id)
+                        if job is None or job.active_trigger_id != active_trigger:
+                            raise RuntimeError("recovery effect lost its active trigger")
+                        if effect_id not in job.active_effect_ids:
+                            uow.save_job_state(replace(
+                                job,
+                                active_effect_ids=(*job.active_effect_ids, effect_id),
+                            ))
                 pickup = (
                     resource_intents.booking_for(effect_id, command.name)
                     if resource_intents is not None
@@ -485,6 +542,10 @@ class TradingCustomerRecoveryRunner:
                 return RecoveryTriggerResult(self.job_id, trigger_id, 0)
             if now < current.logical_time:
                 raise ValueError("composition trigger cannot rewind durable logical time")
+            if current.active_trigger_id not in (None, trigger_id):
+                raise RuntimeError("another recovery occurrence is still active")
+            if current.active_trigger_id is None and current.active_effect_ids:
+                raise RuntimeError("completed recovery job has orphaned effect enrollment")
             uow.save_job_state(replace(
                 current,
                 status="running",
@@ -519,6 +580,7 @@ class TradingCustomerRecoveryRunner:
                 status="ready",
                 phase="idle",
                 active_trigger_id=None,
+                active_effect_ids=(),
                 last_completed_trigger_id=trigger_id,
                 completed_batch_triggers=(
                     *current.completed_batch_triggers, completed_record,
