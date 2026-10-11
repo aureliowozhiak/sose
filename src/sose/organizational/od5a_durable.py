@@ -30,15 +30,33 @@ _ORIGIN = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _KIND = "od5a_durable_pilot"
 
 
-def _precise_time(value: float | int, label: str) -> None:
+def _time_us(value: float | int, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
         raise ValueError(f"{label} requires a finite numeric time")
-    if Decimal(str(value)) * 1_000_000 != (Decimal(str(value)) * 1_000_000).to_integral_value():
+    ticks = Decimal(str(value)) * 1_000_000
+    if ticks != ticks.to_integral_value():
         raise ValueError(f"{label} must have exact microsecond resolution")
+    # A float second offset cannot uniquely represent every microsecond beyond
+    # this bound; reject rather than alias two distinct semantic timestamps.
+    if abs(ticks) > 2**53:
+        raise ValueError(f"{label} exceeds lossless microsecond offset range")
+    return int(ticks)
+
+
+def _precise_time(value: float | int, label: str) -> None:
+    _time_us(value, label)
+
+
+def _add_exact_seconds(start: float, duration: float) -> float:
+    """Arithmetic in integer microseconds, never binary-float addition."""
+    ticks = _time_us(start, "action start") + _time_us(duration, "action duration")
+    if abs(ticks) > 2**53:
+        raise ValueError("scheduled completion exceeds lossless microsecond offset range")
+    return ticks / 1_000_000
 
 
 def _time(offset: float) -> datetime:
-    return _ORIGIN + timedelta(seconds=float(offset))
+    return _ORIGIN + timedelta(microseconds=_time_us(offset, "event timestamp"))
 
 
 def _key(item_id: str, station: str) -> str:
@@ -128,7 +146,7 @@ def _grant(
         "reservation_id": reservation_id,
     }
     _schedule(
-        state, at=at + duration, kind=f"{kind}_done",
+        state, at=_add_exact_seconds(at, duration), kind=f"{kind}_done",
         resource=resource,
     )
 
