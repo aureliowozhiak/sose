@@ -252,21 +252,59 @@ class TradingCustomerRecoveryRunner:
         # before the job checkpoint must not make that slot appear empty.
         with store.transaction() as uow:
             current_job = uow.get_job_state(self.job_id)
-        active_trigger = (
-            current_job.active_trigger_id if current_job is not None else None
-        )
+            active_trigger = (
+                current_job.active_trigger_id if current_job is not None else None
+            )
+            # An accepted Command can commit its business certificate and then
+            # lose the worker *before* the recurring trigger checkpoint. Charge
+            # that certified non-resource effect to its original occurrence.
+            # Mapped effects are instead charged by the physical ledger below.
+            if current_job is not None:
+                for effect_id in current_job.active_effect_ids:
+                    certificate = uow.get_business_effect(effect_id)
+                    command = uow.get_command(effect_id)
+                    if certificate is None:
+                        if command is None:
+                            raise RuntimeError(
+                                "enrolled recovery effect lacks Command and certificate"
+                            )
+                        continue
+                    if command is not None:
+                        raise RuntimeError(
+                            "enrolled recovery effect has certificate and pending Command"
+                        )
+                    if certificate.effect_id != effect_id:
+                        raise RuntimeError("recovery certificate changed effect identity")
+                    deliveries = tuple(
+                        d for d in uow.boundary_deliveries()
+                        if d.message_id == certificate.boundary_message_id
+                    )
+                    if len(deliveries) != 1:
+                        raise RuntimeError("certified recovery effect lost causal boundary")
+                    consumption = uow.get_boundary_consumption(deliveries[0].delivery_id)
+                    if (
+                        consumption is None
+                        or consumption.consumer_effect_id != effect_id
+                    ):
+                        raise RuntimeError("certified recovery effect lacks original ACK")
+                    actions += 1
+            if actions > self.max_actions:
+                raise RuntimeError("committed recovery actions exceed trigger budget")
         # Reconcile a crash after immutable domain certification but before
         # release of its authoritative temporal reservation.
-        if resource_intents is not None:
+        if resource_intents is not None and actions < self.max_actions:
             # A recovered release is a committed physical/causal action, not
             # free extra work. Otherwise a resumed occurrence may emit the
             # NEXT boundary effect one slot earlier than uninterrupted replay.
             actions += resource_intents.reconcile_certified(
-                store, self.resource_organizations, max_completed=self.max_actions,
+                store, self.resource_organizations,
+                max_completed=self.max_actions - actions,
                 trigger_id=active_trigger,
             )
             if actions >= self.max_actions:
                 return actions
+        if actions >= self.max_actions:
+            return actions
         # A deferred effect stays durable, but must not monopolize this tick.
         deferred_this_tick: set[str] = set()
         for _ in range(self.max_actions):
