@@ -509,6 +509,7 @@ jobs:
       SOSE_PC6_FEDERATED_REPORT: pc6-federated-recovery.json
       SOSE_PC6_FEDERATED_FAULT_MATRIX_REPORT: pc6-federated-fault-matrix.json
       SOSE_PC6_MULTIDOMAIN_OSKILL_REPORT: pc6-multidomain-oskill.json
+      SOSE_PC6_REAL_MULTIDOMAIN_REPORT: pc6-real-multidomain.json
 
     steps:
       - name: Checkout
