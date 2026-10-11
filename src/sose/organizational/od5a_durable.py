@@ -52,7 +52,13 @@ def _add_exact_seconds(start: float, duration: float) -> float:
     ticks = _time_us(start, "action start") + _time_us(duration, "action duration")
     if abs(ticks) > 2**53:
         raise ValueError("scheduled completion exceeds lossless microsecond offset range")
-    return ticks / 1_000_000
+    seconds = ticks / 1_000_000
+    if _time_us(seconds, "scheduled completion") != ticks:
+        raise ValueError(
+            "scheduled completion cannot round-trip through float seconds "
+            "without losing a microsecond"
+        )
+    return seconds
 
 
 def _time(offset: float) -> datetime:
