@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from sose.composition.boundary import BoundaryService
-from sose.composition.model import BoundaryMessage
+from sose.composition.model import BoundaryDelivery, BoundaryMessage
 from sose.jobs.model import SimulationJobState
 from sose.persistence.memory import MemoryPersistence
 
@@ -68,7 +68,6 @@ def test_publication_refuses_missing_or_completed_recurring_trigger_atomically(k
     with store.transaction() as uow:
         assert uow.get_boundary_message(message.message_id) is None
         assert uow.get_boundary_delivery(
-            __import__("sose.composition.model", fromlist=["BoundaryDelivery"]).
             BoundaryDelivery.pending(message).delivery_id
         ) is None
 
