@@ -26,6 +26,12 @@ The initial falsification cuts the actual worker via `os._exit(79)` after the re
 
 The oracle reads the two reopened operational namespaces and authoritative resource ledger, verifying entity versions, domain events, receipts, immutable messages, causal DAG, settlement binding, complete job checkpoints, simulation position, resource intervals and events. Physical booking IDs are normalized only by removing deployment namespace scope and then sorting. No business IDs, causal edges or logical time may be discarded.
 
+### Durable action accounting beyond physical resources
+
+The first real O2C post-certificate worker-death falsification uncovered a one-slot discrepancy: domain certificates and DAG facts were identical, but the recovered worker consumed an unfinished O2C slot by publishing a later boundary, advancing the downstream chain one tick early. Only Logistics had an authoritative booking-to-trigger link, so completed non-resource business effects were missing from restart work accounting.
+
+`SimulationJobState.active_effect_ids` now records immutable **unmapped** business Command IDs in the job's fenced UoW **before** executing the actual statechart. An interrupted recurrence reconstructs this set, checks the original durable ACK and terminal `BusinessEffectApplied` certificate, and debits already committed effects from that same slot's bounded action budget. If the Command remains pending, it is retried without charging completed work; if both Command and certificate are absent, recovery fails closed. Successfully completed triggers clear the enrollment atomically with the checkpoint. Mapped Logistics effects remain accounted for by the authoritative physical ledger; no synthetic physical reservations are added to O2C, Payments or R2R to hide a scheduler bug.
+
 **Required artifact:** `pc6-real-multidomain.json` on PostgreSQL CI. It contains canonical hashes of reference and recovered runs.
 
 ## ADR: staged promotion, not a blanket distributed exactly-once claim
