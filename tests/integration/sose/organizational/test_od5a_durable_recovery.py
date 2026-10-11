@@ -321,7 +321,10 @@ def test_fractional_exact_microseconds_match_simpy_after_addition(tmp_path, arm_
         ) for e in expected.events)
         assert state["completed"] == dict(expected.completed_at)
         assert actual == expected_trace
+        from decimal import Decimal
+
         assert all(
-            round(e.payload["end"] * 1_000_000) == e.payload["end"] * 1_000_000
+            (ticks := Decimal(str(e.payload["end"])) * 1_000_000)
+            == ticks.to_integral_value()
             for e in events
         )
