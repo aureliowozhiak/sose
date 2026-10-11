@@ -28,19 +28,30 @@ jobs:
           uv run --frozen python scripts/organizational_official_run.py --help
 
   official-frozen-experiment:
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    # Safe for PRs: replay pinned source, never publish a new official v1 release.
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        domain: [o2c, mro]
+        include:
+          - domain: o2c
+            expected_result_sha: c51013cb109f67f5e39bb87385f0b666632c2db953d3084d7dd6ce95adc6500c
+          - domain: mro
+            expected_result_sha: 7e23c5f230034c3fb4cf79786110332e9b8c6da299a18bd3245a56fc13228740
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout exact immutable O2C/MRO v1 source
+        uses: actions/checkout@v7
+        with:
+          ref: 3c356fea6adba2d27f583d3a1469e5df1c0b651b
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v10.3.0
+      - name: Verify approved historical source identity
+        run: test "$(git rev-parse HEAD)" = "3c356fea6adba2d27f583d3a1469e5df1c0b651b"
       - name: Install exact locked dependencies
         run: uv sync --frozen --extra dev
       - name: Verify separate scientific freeze without executing any world
@@ -86,17 +97,24 @@ jobs:
           PY
         env:
           DOMAIN: ${{ matrix.domain }}
-      - name: Publish permanent official scientific release
+      - name: Assert immutable v1 scientific result
         env:
-          GH_TOKEN: ${{ github.token }}
           DOMAIN: ${{ matrix.domain }}
+          EXPECTED_RESULT_SHA: ${{ matrix.expected_result_sha }}
         run: |
-          tar -czf "${DOMAIN}-v1-evidence.tar.gz" "official-${DOMAIN}-v1/"
-          sha256sum "${DOMAIN}-v1-evidence.tar.gz" > "${DOMAIN}-v1-evidence.tar.gz.sha256"
-          gh release create "${DOMAIN}-v1-evidence-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}" \
-            "${DOMAIN}-v1-evidence.tar.gz" "${DOMAIN}-v1-evidence.tar.gz.sha256" \
-            --target "$GITHUB_SHA" --title "${DOMAIN} frozen synthetic v1 evidence" \
-            --notes "Audited A0 synthetic intervention execution only. Separate immutable protocol and full src/sose tree/uv.lock verified before any world. No empirical validity claim."
+          uv run --frozen python - <<'PY'
+          from pathlib import Path
+          import json
+          import os
+          root = Path("official-" + os.environ["DOMAIN"] + "-v1")
+          manifest = json.loads((root / "result-manifest.json").read_text())
+          assert manifest["result_hash"] == os.environ["EXPECTED_RESULT_SHA"]
+          evidence = json.loads((root / "evidence-manifest.json").read_text())
+          assert evidence["result_hash"] == os.environ["EXPECTED_RESULT_SHA"]
+          PY
+
+      # Never create a new tagged 'v1' release for an immutable result.
+      # Approved published SHA-256 sidecars belong to their original execution.
       - name: Preserve complete or interrupted run evidence
         if: always()
         uses: actions/upload-artifact@v7
