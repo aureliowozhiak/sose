@@ -30,6 +30,7 @@ class ActorCategory(StrEnum):
     EXECUTION = "execution"
     COORDINATION = "coordination"
     ADAPTATION = "adaptation"
+    DEVELOPMENT = "development"
     GOVERNANCE = "governance"
 
 
@@ -41,6 +42,7 @@ class ItemLedgerInterval(BaseModel):
     primary: ItemCategory
     cause: str | None = None
     secondary_labels: tuple[str, ...] = ()
+    config_epoch: int | None = Field(default=None, ge=0)
     model_spec_hash: str | None = None
 
     @model_validator(mode="after")
@@ -49,6 +51,8 @@ class ItemLedgerInterval(BaseModel):
             raise ValueError("ledger interval endpoints must be finite")
         if self.end <= self.start:
             raise ValueError("ledger interval end must be greater than start")
+        if self.config_epoch is not None and not self.model_spec_hash:
+            raise ValueError("config_epoch requires model_spec_hash provenance")
         return self
 
     @property
@@ -71,6 +75,12 @@ class ItemLedger(BaseModel):
         for previous, current in zip(ordered, ordered[1:], strict=False):
             if not _time_equal(previous.end, current.start):
                 raise ValueError("item ledger contains a gap or overlap")
+            if (previous.config_epoch is not None and current.config_epoch is not None
+                and current.config_epoch < previous.config_epoch):
+                raise ValueError("item ledger config_epoch cannot regress")
+            if (previous.config_epoch is not None and previous.config_epoch == current.config_epoch
+                and previous.model_spec_hash != current.model_spec_hash):
+                raise ValueError("same config_epoch cannot change ModelSpec identity")
         object.__setattr__(self, "intervals", ordered)
         return self
 
@@ -113,7 +123,9 @@ class ActorLedgerInterval(BaseModel):
     category: ActorCategory
     allocation: float = Field(default=1.0, gt=0.0, le=1.0)
     work_item_id: str | None = None
+    cause: str | None = None
     secondary_labels: tuple[str, ...] = ()
+    config_epoch: int | None = Field(default=None, ge=0)
     model_spec_hash: str | None = None
 
     @model_validator(mode="after")
@@ -124,6 +136,8 @@ class ActorLedgerInterval(BaseModel):
             raise ValueError("actor allocation must be finite")
         if self.end <= self.start:
             raise ValueError("ledger interval end must be greater than start")
+        if self.config_epoch is not None and not self.model_spec_hash:
+            raise ValueError("config_epoch requires model_spec_hash provenance")
         if self.category in {ActorCategory.UNAVAILABLE, ActorCategory.IDLE} and not isclose(
             self.allocation,
             1.0,
@@ -155,6 +169,15 @@ class ActorLedger(BaseModel):
     def validate_capacity(self) -> "ActorLedger":
         ordered = tuple(sorted(self.intervals, key=lambda interval: (interval.start, interval.end)))
         object.__setattr__(self, "intervals", ordered)
+        for previous, current in zip(ordered, ordered[1:], strict=False):
+            if previous.config_epoch is None or current.config_epoch is None:
+                continue
+            if current.start < previous.end and current.config_epoch != previous.config_epoch:
+                raise ValueError("actor capacity spans conflicting config epochs")
+            if current.start >= previous.end and current.config_epoch < previous.config_epoch:
+                raise ValueError("actor config_epoch cannot regress")
+            if current.config_epoch == previous.config_epoch and current.model_spec_hash != previous.model_spec_hash:
+                raise ValueError("same actor config_epoch cannot change ModelSpec identity")
         if self.fractional_multitasking:
             self._validate_fractional_capacity()
         else:
