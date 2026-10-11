@@ -4,7 +4,7 @@
 
 ## 1. Reproducible world construction
 
-Sample **64 Sobol design points**, each with **16** counter-CRN replications. Each point is fixed by *configured* offered load, calendar availability, dependency density, routing complexity, nominal service distribution and nominal coordination latency, plus declared costs. Exclude derived realized WIP, resource utilization, delay fractions and outcomes from any input regime classifier.
+Sample **32 Sobol strata over non-load coordinates**, cross **each stratum** with the fixed nominal-load grid `{0.4,0.6,0.8,1.0,1.2,1.4,1.6}` and run **16** counter-CRN replications per arm/world (32 × 7 × 16 × 5 = **17,920** arm-world-replication executions). Offered load uses **baseline nominal execution capacity** as denominator. The identical non-load stratum at multiple load coordinates is necessary to bracket `R*`; drawing single multivariate Sobol points with different nuisance coordinates would make `R*` unidentified. Every stratum is configured by calendar availability, dependency density, routing complexity, nominal service distribution and nominal coordination latency, plus declared costs. Exclude derived realized WIP, resource utilization, delay fractions and outcomes from any input regime classifier.
 
 Each world/arm must bind `ModelSpec` identity, `config_epoch`, intervention hash, immutable root seed and CRN mechanism/entity stream identities. Counter draw indices must not depend on unrelated scheduling or execution order. If topology changes identity/opportunity sets, record that stream as nonpairable; do not claim a false paired CRN comparison.
 
