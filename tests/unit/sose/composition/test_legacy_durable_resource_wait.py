@@ -94,3 +94,32 @@ def test_synchronous_reference_path_retries_only_typed_temporary_capacity_wait(
     result = customer.run_customer_demand_path()
     assert len(attempts) == 2
     assert result.persistence.entity("shipment", result.shipment_id).state == "delivered"
+
+
+def test_real_logistics_origin_dock_contention_is_durable_wait(monkeypatch):
+    """A second independent workflow cannot treat a finite dock queue as failure."""
+    original = customer.logistics.reconcile_origin_hub
+    calls = []
+    blocker = "origin-dock:concurrent-blocker"
+
+    def contend_once(persistence, engine, backend, *, entities):
+        calls.append(entities.shipment_id)
+        if len(calls) == 1:
+            holding = engine.resources.ensure_requested(
+                backend, resource_name="origin_dock",
+                request_id=blocker, requested_at=backend.now,
+            )
+            backend.run_until(backend.now)
+            assert holding is not None
+        else:
+            engine.resources.withdraw(backend, blocker)
+            backend.run_until(backend.now)
+        return original(
+            persistence, engine, backend, entities=entities,
+        )
+
+    monkeypatch.setattr(customer.logistics, "reconcile_origin_hub", contend_once)
+    result = customer.run_customer_demand_path()
+    assert len(calls) >= 2
+    assert result.persistence.entity("shipment", result.shipment_id).state == "delivered"
+    assert result.persistence.business_effects()
