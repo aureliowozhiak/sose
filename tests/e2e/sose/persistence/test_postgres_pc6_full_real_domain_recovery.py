@@ -611,7 +611,6 @@ raise AssertionError("real boundary OS-kill probe did not fire")
 
 
 def _run_real_boundary_cut(dsn, *, cut=None):
-    from sose.composition.boundary import BoundaryService
     from sose.composition.model import DeliveryStatus
 
     domains = {"a": _name("pc6ack_a"), "b": _name("pc6ack_b")}
