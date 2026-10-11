@@ -35,3 +35,10 @@ This is an **additive reference recovery oracle**, not yet the normal OD-5a SimP
 The canonical `Entity` clock is scoped to `job_id`; this avoids inventing an unnecessary shared organizational clock. The reference's physical coordinator capacity is a registered pilot assumption, not observational evidence.
 
 **No confirmatory outcome can be published from this PR.** An independent execution freeze must fix: exact source and `uv.lock` identities, numeric Sobol bounds and physical coordinate mapping, horizon and warmup, root/replication seeds, exogenous arrival/service counter streams, cost and transition-time schedule, complete intervention manifests, admissibility, censoring, causal recovery gates, audit bundle schema, and the independent SHA-256 verifier. A freeze is invalid if any field remains `UNSET` or a numerical parameter is chosen after looking at outcomes.
+
+
+## Added differential and atomicity falsification
+
+The implementation additionally requires equality of the small deterministic operational trace (physical instance, start/end, dependency source/target and action kind) against the independent ephemeral SimPy pilot for **all five** registered arms. Merely replaying the same persistent reducer twice would be insufficient evidence of mechanism equivalence.
+
+Separate real OS worker-kill tests target both sides of the transaction boundary: death after a durable event is committed but before acknowledgment, and death **inside the SQLite UnitOfWork** immediately after appending an event but before commit. The latter must roll back every uncommitted causal and resource effect. Two job IDs sharing one SQLite database must advance independently without cross-job reservations.
