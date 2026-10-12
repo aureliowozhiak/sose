@@ -54,7 +54,7 @@ def _arms():
     )}
 
 
-def _seed(path, jobs):
+def _seed(path, jobs, *, drain=True):
     with SQLitePersistence(path) as store:
         for job, arm in jobs.items():
             initialize_od5a_durable(
@@ -65,11 +65,15 @@ def _seed(path, jobs):
                 ),),
             )
         for job in jobs:
-            for _ in range(80):
-                if not advance_od5a_durable(store, job_id=job):
-                    break
+            if not drain:
+                assert advance_od5a_durable(store, job_id=job)  # arrival
+                assert advance_od5a_durable(store, job_id=job)  # first real completion
             else:
-                raise AssertionError("physical source did not finish")
+                for _ in range(80):
+                    if not advance_od5a_durable(store, job_id=job):
+                        break
+                else:
+                    raise AssertionError("physical source did not finish")
             assert any(e.payload["kind"] == "execution"
                        for e in od5a_durable_events(store, job_id=job))
         assert not store.resource_reservations()
@@ -177,8 +181,10 @@ def test_kill_after_each_committed_boundary_phase_reconstructs_full_truth(
 def test_killed_owner_claim_blocks_until_lease_expiry_then_fences_recovery(tmp_path):
     jobs = {"org:alpha": "baseline"}
     control, killed = tmp_path / "control.db", tmp_path / "killed.db"
-    _seed(control, jobs)
-    _seed(killed, jobs)
+    # Only one committed physical event: another free event must not
+    # mask the active competing lease with unrelated progress.
+    _seed(control, jobs, drain=False)
+    _seed(killed, jobs, drain=False)
 
     for path in (control, killed):
         with SQLitePersistence(path) as store:
