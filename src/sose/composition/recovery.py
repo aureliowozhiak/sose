@@ -25,6 +25,7 @@ from sose.examples.order_to_cash import simulation as o2c
 from sose.examples.cards_payments import simulation as payments
 from sose.examples.record_to_report import simulation as r2r
 from sose.jobs.model import CompletedJobTrigger, SimulationJobState
+from sose.jobs.registration import job_registration_guard
 from sose.persistence.base import Persistence
 from sose.persistence.ownership import FencedEnginePersistence
 
@@ -621,29 +622,29 @@ class TradingCustomerRecoveryRunner:
     ) -> RecoveryTriggerResult:
         if not trigger_id:
             raise ValueError("trigger_id must be nonempty")
-        if self.scoped_writer:
-            lease = self.persistence.claim_scoped_writer(
-                self.job_id, self.owner_id,
-                expected_epoch=self.persistence.scoped_writer_epoch(self.job_id),
-                correlation_id=self.correlation_id,
-            )
-        else:
-            lease = self.persistence.claim_writer(
-                self.owner_id, expected_epoch=self.persistence.writer_epoch(),
-            )
-        store = FencedEnginePersistence(self.persistence, lease)
         config = {}
         if self.scoped_writer:
             config['correlation_id'] = self.correlation_id
             if self.resource_organizations is not None:
                 config['organization_id'] = self.resource_organizations[self.correlation_id]
         config_json = json.dumps(config, sort_keys=True, separators=(',', ':'))
-        with store.transaction() as uow:
-            current = uow.get_job_state(self.job_id)
-            if current is not None and current.config_json != config_json:
-                raise ValueError('recovery job\'s durable organizational binding changed')
-            if current is None:
-                current = SimulationJobState(
+        # Enroll all creation paths behind one job-scoped identity fence.
+        # Preflight BEFORE any scoped/global writer claim: a failed foreign
+        # registration must not advance epochs or bind a correlation.
+        with job_registration_guard(self.persistence, self.job_id):
+            # PostgreSQL job_state() refreshes the authoritative revision.
+            # Do not open an unfenced transaction here: an existing global
+            # writer epoch intentionally rejects such transactions.
+            prior = self.persistence.job_state(self.job_id)
+            if prior is not None and prior.domain_name != "trading_company_composition":
+                raise ValueError("recovery job identity already belongs to another domain")
+            if prior is not None and prior.config_json != config_json:
+                raise ValueError("recovery job's durable organizational binding changed")
+            if prior is None:
+                # The writer epoch and the first durable domain identity must
+                # become visible in ONE OLTP commit. A real os._exit directly
+                # after the claim cannot leave an ownerless fenced namespace.
+                initial = SimulationJobState(
                     job_id=self.job_id,
                     domain_name="trading_company_composition",
                     config_json=config_json,
@@ -653,28 +654,65 @@ class TradingCustomerRecoveryRunner:
                     logical_time=now,
                     next_tick=0,
                 )
-            if current.last_completed_trigger_id == trigger_id or any(
-                record.trigger_id == trigger_id
-                for record in current.completed_batch_triggers
-            ):
-                return RecoveryTriggerResult(self.job_id, trigger_id, 0)
-            if now < current.logical_time:
-                raise ValueError("composition trigger cannot rewind durable logical time")
-            if current.active_trigger_id not in (None, trigger_id):
-                raise RuntimeError("another recovery occurrence is still active")
-            if current.active_trigger_id is None and (
-                current.active_effect_ids or current.active_boundary_message_ids
-                or current.active_publication_message_ids
-            ):
-                raise RuntimeError("completed recovery job has orphaned work enrollment")
-            uow.save_job_state(replace(
-                current,
-                status="running",
-                phase="reconcile",
-                active_trigger_id=trigger_id,
-                logical_time=now,
-                last_triggered_at=now,
-            ))
+                if self.scoped_writer:
+                    atomic_claim = getattr(self.persistence, "claim_scoped_writer_and_register", None)
+                    if not callable(atomic_claim):
+                        raise TypeError("scoped recovery requires atomic claim+registration")
+                    lease = atomic_claim(
+                        self.job_id, self.owner_id,
+                        expected_epoch=self.persistence.scoped_writer_epoch(self.job_id),
+                        correlation_id=self.correlation_id, initial_job=initial,
+                    )
+                else:
+                    atomic_claim = getattr(self.persistence, "claim_writer_and_register", None)
+                    if not callable(atomic_claim):
+                        raise TypeError("recovery requires atomic claim+registration")
+                    lease = atomic_claim(
+                        self.owner_id,
+                        expected_epoch=self.persistence.writer_epoch(),
+                        initial_job=initial,
+                    )
+            elif self.scoped_writer:
+                lease = self.persistence.claim_scoped_writer(
+                    self.job_id, self.owner_id,
+                    expected_epoch=self.persistence.scoped_writer_epoch(self.job_id),
+                    correlation_id=self.correlation_id,
+                )
+            else:
+                lease = self.persistence.claim_writer(
+                    self.owner_id, expected_epoch=self.persistence.writer_epoch(),
+                )
+            store = FencedEnginePersistence(self.persistence, lease)
+            with store.transaction() as uow:
+                current = uow.get_job_state(self.job_id)
+                if current is not None and current.domain_name != "trading_company_composition":
+                    raise ValueError("recovery job identity already belongs to another domain")
+                if current is not None and current.config_json != config_json:
+                    raise ValueError('recovery job\'s durable organizational binding changed')
+                if current is None:
+                    raise RuntimeError("recovery writer claim lacks atomic durable job identity")
+                if current.last_completed_trigger_id == trigger_id or any(
+                    record.trigger_id == trigger_id
+                    for record in current.completed_batch_triggers
+                ):
+                    return RecoveryTriggerResult(self.job_id, trigger_id, 0)
+                if now < current.logical_time:
+                    raise ValueError("composition trigger cannot rewind durable logical time")
+                if current.active_trigger_id not in (None, trigger_id):
+                    raise RuntimeError("another recovery occurrence is still active")
+                if current.active_trigger_id is None and (
+                    current.active_effect_ids or current.active_boundary_message_ids
+                    or current.active_publication_message_ids
+                ):
+                    raise RuntimeError("completed recovery job has orphaned work enrollment")
+                uow.save_job_state(replace(
+                    current,
+                    status="running",
+                    phase="reconcile",
+                    active_trigger_id=trigger_id,
+                    logical_time=now,
+                    last_triggered_at=now,
+                ))
 
         lease_clock = observed_at if observed_at is not None else now
         if self.resource_policies is None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import re
 from typing import Iterator
 
@@ -10,6 +11,7 @@ from psycopg import sql
 
 from sose.core.resource_identity import ResourceAddress
 
+from .codec import dumps, loads
 from .memory import MemoryPersistence, MemoryUnitOfWork, _State, fork_state
 from .records import StateRecord, changes_for_dirty_records, records_to_state
 
@@ -169,6 +171,19 @@ class PostgresPersistence(MemoryPersistence):
         self._revision = -1
         self._refresh_from_db(force=True)
 
+    def trusted_utc_now(self) -> datetime:
+        """Return authoritative database wall time for cross-host lease fencing.
+
+        SELECT clock_timestamp() is evaluated at the call, not the beginning
+        of a possibly long-lived transaction, unlike transaction_timestamp().
+        Call while holding the job-scoped advisory guard immediately before
+        validating or writing lease expiry. Worker-supplied clocks are ignored.
+        """
+        record = self._connection.execute("SELECT clock_timestamp()").fetchone()
+        if record is None or not isinstance(record[0], datetime):
+            raise RuntimeError("PostgreSQL trusted clock unavailable")
+        return record[0].astimezone(timezone.utc)
+
     @contextmanager
     def business_resource_guard(
         self, resource_name: str | ResourceAddress,
@@ -259,7 +274,13 @@ class PostgresPersistence(MemoryPersistence):
         dirty_records,
     ) -> int:
         changes = changes_for_dirty_records(before, after, dirty_records)
+        event_appends = tuple(change for change in changes if change.collection == "events")
         for change in changes:
+            if change.collection == "events":
+                # Appends live in one shared log even when source/job fences
+                # belong to independent organizations. Their index in the
+                # UoW snapshot is NOT a globally unique record key.
+                continue
             if change.operation == "delete":
                 self._connection.execute(
                     sql.SQL(
@@ -291,7 +312,81 @@ class PostgresPersistence(MemoryPersistence):
                 raise RuntimeError(
                     f"unknown state record operation: {change.operation}"
                 )
+        if event_appends:
+            self._append_postgres_events(before, after, event_appends)
         return len(changes)
+
+    def _append_postgres_events(
+        self, before: _State, after: _State, changes,
+    ) -> None:
+        """Linearize only the shared event-log tail, never organizational work.
+
+        Separate organization transactions may read the same event count.
+        The PostgreSQL append critical section allocates monotonically
+        increasing positions at COMMIT; record identity is the event ID.
+        A failed/duplicate append aborts its enclosing source+checkpoint UoW.
+        """
+        self._connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+            (self.namespace, "durable:event-append"),
+        )
+        row = self._connection.execute(
+            sql.SQL(
+                "SELECT COALESCE(MAX(position), -1) FROM {} WHERE collection = %s"
+            ).format(self._record_table),
+            ("events",),
+        ).fetchone()
+        assert row is not None
+        next_position = int(row[0]) + 1
+        for change in sorted(changes, key=lambda item: item.position):
+            if (
+                change.operation != "upsert"
+                or change.position is None
+                or change.position < len(before.events)
+                or change.position >= len(after.events)
+            ):
+                raise ValueError("PostgreSQL durable events are append-only")
+            event = after.events[change.position]
+            if not event.event_id:
+                raise ValueError("PostgreSQL durable event ID cannot be empty")
+            # Exact deterministic replay is idempotent; a reused identity
+            # with changed causal facts is not. Inspect legacy numeric-key
+            # events in this UoW's snapshot as well as new identity keys.
+            earlier = tuple(
+                item for item in before.events if item.event_id == event.event_id
+            )
+            if earlier:
+                if any(item != event for item in earlier):
+                    raise ValueError(
+                        f"conflicting PostgreSQL durable event ID: {event.event_id}"
+                    )
+                continue
+            payload = dumps(event)
+            key = "event:" + event.event_id
+            stored = self._connection.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {}(collection, record_key, position, payload)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT(collection, record_key) DO NOTHING
+                    RETURNING record_key
+                    """
+                ).format(self._record_table),
+                ("events", key, next_position, payload),
+            ).fetchone()
+            if stored is None:
+                original = self._connection.execute(
+                    sql.SQL(
+                        "SELECT payload FROM {} WHERE collection = %s AND record_key = %s"
+                    ).format(self._record_table),
+                    ("events", key),
+                ).fetchone()
+                if original is None or loads(str(original[0])) != event:
+                    raise ValueError(
+                        f"conflicting PostgreSQL durable event ID: {event.event_id}"
+                    )
+                continue
+            next_position += 1
 
     def writer_epoch(self) -> int:
         row = self._connection.execute(
@@ -329,6 +424,27 @@ class PostgresPersistence(MemoryPersistence):
                     f"writer claim lost: expected epoch {expected_epoch}"
                 )
             return WriterLease(owner_id=owner_id, epoch=int(row[0]))
+
+    def claim_writer_and_register(
+        self, owner_id: str, *, expected_epoch: int, initial_job,
+    ) -> WriterLease:
+        """Atomically fence the writer AND persist a previously absent job ID.
+
+        A crash after this call may leave a pending job, but never an orphaned
+        positive writer epoch with no authoritative domain identity.
+        """
+        with self._connection.transaction():
+            lease = self.claim_writer(owner_id, expected_epoch=expected_epoch)
+            with self.transaction(owner_epoch=lease.epoch) as uow:
+                prior = uow.get_job_state(initial_job.job_id)
+                if prior is not None:
+                    if prior.domain_name != initial_job.domain_name:
+                        raise ValueError("recovery job identity already belongs to another domain")
+                    if prior.config_json != initial_job.config_json:
+                        raise ValueError("recovery job's durable organizational binding changed")
+                else:
+                    uow.save_job_state(initial_job)
+            return lease
 
     def scoped_writer_epoch(self, scope: str) -> int:
         if not scope:
@@ -409,6 +525,27 @@ class PostgresPersistence(MemoryPersistence):
                 (scope, owner_id, current + 1),
             )
             return ScopedWriterLease(owner_id, current + 1, scope)
+
+    def claim_scoped_writer_and_register(
+        self, scope: str, owner_id: str, *, expected_epoch: int,
+        correlation_id: str | None, initial_job,
+    ) -> ScopedWriterLease:
+        """Commit scoped claim/correlation reservation and job ID together."""
+        with self._connection.transaction():
+            lease = self.claim_scoped_writer(
+                scope, owner_id, expected_epoch=expected_epoch,
+                correlation_id=correlation_id,
+            )
+            with self.transaction(owner_epoch=lease.epoch, writer_scope=scope) as uow:
+                prior = uow.get_job_state(initial_job.job_id)
+                if prior is not None:
+                    if prior.domain_name != initial_job.domain_name:
+                        raise ValueError("recovery job identity already belongs to another domain")
+                    if prior.config_json != initial_job.config_json:
+                        raise ValueError("recovery job's durable organizational binding changed")
+                else:
+                    uow.save_job_state(initial_job)
+            return lease
 
     @contextmanager
     def boundary_transaction(

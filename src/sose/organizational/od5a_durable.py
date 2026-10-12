@@ -8,13 +8,14 @@ This is NOT the confirmatory OD-5a execution engine or independent freeze.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from math import isfinite
 import json
-from typing import Any
+from typing import Any, Callable
 
 from sose.core.events import DomainEvent
 from sose.core.identity import deterministic_id
@@ -267,11 +268,37 @@ def _transition(uow: Any, state: dict[str, Any], job_id: str) -> bool:
     return True
 
 
+
+@contextmanager
+def _source_transaction(store: Persistence, job_id: str):
+    """Serialize source ownership transfer and standalone advances per job.
+
+    PostgresPersistence uses last-writer-wins record updates. Its existing
+    per-resource advisory session lock serializes the single organization
+    through the transaction; separate organizations never share this lock.
+    The recurring runner uses the EXACT SAME lock key before binding the
+    SimulationJobState or advancing physical source truth.
+    """
+    guard = getattr(store, "business_resource_guard", None)
+    if callable(guard):
+        with guard("od5a:recurring:" + job_id):
+            with store.transaction() as uow:
+                yield uow
+    else:
+        with store.transaction() as uow:
+            yield uow
+
+
 def initialize_od5a_durable(
     store: Persistence, *, job_id: str, arm: OD5aCompiledArm,
     items: tuple[OD5aWorkItem, ...],
+    _bind_uow: Callable[[Any], None] | None = None,
 ) -> None:
-    """Idempotent identity-bound start; every mutation is one durable UoW."""
+    """Idempotent physical start; optional owner checkpoint binds in SAME UoW.
+
+    The recurring adapter uses this private binder to atomically enroll its
+    SimulationJobState. Standalone reference sources have no owner binder.
+    """
     if not job_id or arm.arm_id not in ALL_ARMS or not items:
         raise ValueError("registered arm, job ID and nonempty workload required")
     # The arm label alone is not scientific admission. Treating hand-made arm
@@ -327,11 +354,13 @@ def initialize_od5a_durable(
     })
     resources = {f"execution:{i}": None for i in range(raw_slots)}
     resources["coordination:0"] = None
-    with store.transaction() as uow:
+    with _source_transaction(store, job_id) as uow:
         previous = uow.get_entity(_KIND, job_id)
         if previous is not None:
             if previous.attributes["identity"] != identity:
                 raise ValueError("immutable OD-5a pilot workload/model identity conflicts")
+            if _bind_uow is not None:
+                _bind_uow(uow)
             return
         for resource in resources:
             uow.save_resource_definition(ResourceDefinition(f"{job_id}/{resource}", 1))
@@ -358,23 +387,46 @@ def initialize_od5a_durable(
             created_at=_ORIGIN, updated_at=_ORIGIN,
             attributes=state,
         ))
+        if _bind_uow is not None:
+            _bind_uow(uow)
+
+
+def _advance_od5a_in_uow(uow: Any, *, job_id: str) -> bool:
+    """Advance physical truth inside a caller-owned authoritative UoW.
+
+    The recurring adapter couples its fenced job checkpoint and the physical
+    event/resource transaction with this same transaction, never a second
+    post-commit write. The standalone reference reducer calls it unchanged.
+    """
+    entity = uow.get_entity(_KIND, job_id)
+    if entity is None:
+        raise KeyError(f"unknown OD-5a durable pilot: {job_id}")
+    state = deepcopy(entity.attributes)
+    if state["done"]:
+        return False
+    advanced = _transition(uow, state, job_id)
+    entity.attributes = state
+    entity.state = "done" if state["done"] else "running"
+    entity.touch(_time(state["clock"]))
+    uow.save_entity(entity)
+    return advanced
 
 
 def advance_od5a_durable(store: Persistence, *, job_id: str) -> bool:
-    """One atomic semantic event; reopen same store to resume without replay."""
-    with store.transaction() as uow:
-        entity = uow.get_entity(_KIND, job_id)
-        if entity is None:
-            raise KeyError(f"unknown OD-5a durable pilot: {job_id}")
-        state = deepcopy(entity.attributes)
-        if state["done"]:
-            return False
-        advanced = _transition(uow, state, job_id)
-        entity.attributes = state
-        entity.state = "done" if state["done"] else "running"
-        entity.touch(_time(state["clock"]))
-        uow.save_entity(entity)
-    return advanced
+    """One atomic reference step, unless a fenced recurring job owns the source.
+
+    The source reducer remains the independent reference oracle, but may not
+    mutate a source owned by a recurring SimulationJobState without that job's
+    lease and checkpoint committing in the same UoW. The recurring adapter
+    uses _advance_od5a_in_uow after validating its epoch inside the UoW.
+    """
+    with _source_transaction(store, job_id) as uow:
+        owning_job = uow.get_job_state(job_id)
+        if owning_job is not None and owning_job.domain_name == "od5a":
+            raise RuntimeError(
+                "OD-5a recurring source requires fenced job advancement"
+            )
+        return _advance_od5a_in_uow(uow, job_id=job_id)
 
 
 def od5a_durable_state(store: Persistence, *, job_id: str) -> dict[str, Any]:

@@ -1,0 +1,31 @@
+# OD-5a recurring SimPy dispatch bridge — first #485 source-step slice
+
+Tracker: #485 under #477. Relies on merged #479, #482, #484 and #486. **Not promotion of the production-native SimPy mechanism.** The five-arm prospective scientific execution freeze remains `NOT_ADMITTED`.
+
+## PRD
+
+The first recurring adapter must prove that an actual externally invoked `SimulationJobState` can own a **scoped source-step claim** and advance one committed physical organizational action through the native `SimPyBackend` event scheduler, without losing source truth or duplicating physical allocations after real worker death.
+
+## TRD — bounded implementation
+
+- `initialize_od5a_recurring_job` freezes compiled arm/model and pilot workload provenance against the organization's authoritative source Entity and binds one initialized `SimulationJobState`. It refuses retroactive adoption of already advanced source history.
+- The external scheduler **must record and pass the same nonempty `trigger_id` on every retry** (including a worker dying after COMMIT but before response). This ID is validated against the deterministic next `run_count+1` occurrence; silently minting the next ID on recovery is prohibited. `claim_od5a_recurring_tick` registers the supplied ID in a transaction with a versioned `od5a_runner_lease` entity scoped to that organization, unique owner, strictly increasing epoch and expiration. A different live owner cannot steal the claim. Recovery of an expired incomplete trigger requires `recover=True`, then increments the epoch.
+- PostgreSQL claims and callbacks use a **per-organization PostgreSQL advisory session lock** (`business_resource_guard("od5a:recurring:" + job_id)`) held across the authoritative record UoW. This prevents the adapter's last-writer-wins PostgreSQL record semantics from issuing two epoch-1 claims on separate connections; unrelated organizations use different lock keys and need no artificial shared clock. SQLite retains `BEGIN IMMEDIATE` transaction behavior.
+- `execute_od5a_claimed_tick` reconstructs a disposable native `SimPyBackend`, schedules the next authoritative action at the organization-local simulated timestamp, and runs exactly that callback. **In the callback's authoritative transaction**, validate the exact runner epoch/owner/expiry and unchanged scheduled action, advance the existing physical reducer via `_advance_od5a_in_uow`, commit the DomainEvent and resource ledger, update `SimulationJobState` clock/tick/completed-trigger ID, and release the runner lease **atomically**.
+- `run_od5a_recurring_tick` is a bounded recurring invocation wrapper. Retrying the latest committed trigger returns `replayed` without another physical stage. Death after claim requires expiration/recover; death before UoW COMMIT rolls back source+checkpoint together; death after COMMIT leaves both intact.
+- No global `SimulationPosition` or simulated global clock; each organization's source Entity owns logical time. Physical reservation arbitration remains the existing authoritative OD-5a reducer. Do not serialize `simpy.Environment`, Process, Event or pending callbacks.
+
+- Once a source organization is bound to its recurring `SimulationJobState`, the standalone public `advance_od5a_durable` entrypoint rejects direct advancement. Fenced recurring advancement uses the private in-UoW source primitive only after verifying the job lease, so two public writer APIs cannot contradict each other by silently bypassing the runner fence.
+
+## TDD falsification
+
+Five compiled reference arms compare complete physical source state/events/resource leases against the standalone durable reducer. Real OS processes die after claim and after source COMMIT; stale fencing tokens cannot dispatch. Injected exception after job-state staging but before commit verifies source DomainEvent + job checkpoint rollback. Duplicate external trigger replay after real post-COMMIT worker death, PostgreSQL OS-death recovery and two independently opened PostgreSQL processes racing to claim the same epoch, plus interleaved independent organization clocks, are tested.
+
+
+- The standalone OD-5a source initializer and reference advance now hold **that same per-organization PostgreSQL lock**, including the ownership check and COMMIT. Therefore a reference writer cannot race the atomic bind of a recurring job into a contradictory source/checkpoint pair.
+- Every claim and SimPy dispatch callback **rechecks the lease using an independent trusted clock after acquiring its per-job transaction guard**: `PostgresPersistence.trusted_utc_now()` runs `SELECT clock_timestamp()` on the authoritative database; SQLite uses the local UTC system clock. Worker-provided invocation `now` is validated for timezone awareness but **never** determines acquisition, takeover, expiry or callback authorization. A worker with an artificially future clock cannot steal another live lease or invalidate it. Deterministic SQLite reference tests inject a controlled clock to exercise timely and expired callbacks. **PostgreSQL refuses any `_wall_clock` override**, including from supposedly private test hooks; real PostgreSQL tests use server time and actual lease expiry across worker death, plus negative override and host-skew probes.
+- Regression gates include a real two-connection PostgreSQL race between standalone source advancement and recurring ownership transfer; the only allowed results are an advanced unbound source **or** a bound source at tick zero, never an incoherent mixture.
+
+## ADR — stop rule and next incremental work
+
+This is a **SimPy-dispatched, reducer-authoritative source step**, not the full production SimPy physical backend. The physical allocation algorithm currently remains `od5a_durable._dispatch`; replacing its semantics with native persistent SimPy resource arbitration requires three-way conformance against the independent pilot and red/green physics probes. The boundary reconciler from #484 still needs to be integrated into recurring execution under the *same fenced worker protocol*, with exact crash windows. The runner's SQLite lease/checkpoint baseline must be certified separately on PostgreSQL under real contending processes and database failures before any production promotion. Scientific DOE, independent hash seal, and a claim of full #485 completion are prohibited.
