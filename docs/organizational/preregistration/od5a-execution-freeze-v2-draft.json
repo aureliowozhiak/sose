@@ -1,0 +1,58 @@
+{
+  "protocol_id": "od5a-structure-capacity-v2",
+  "stage": "NOT_ADMITTED",
+  "source_tree_oid": "UNSET_UNTIL_FINAL_RUNTIME_MERGE",
+  "uv_lock_sha256": "UNSET",
+  "preregistration_sha256": "UNSET",
+  "model_spec_hashes": {
+    "baseline": "UNSET",
+    "capacity_only": "UNSET",
+    "topology_only": "UNSET",
+    "coordination_only": "UNSET",
+    "structural_combined": "UNSET"
+  },
+  "admission_hashes": {
+    "baseline": "UNSET",
+    "capacity_only": "UNSET",
+    "topology_only": "UNSET",
+    "coordination_only": "UNSET",
+    "structural_combined": "UNSET"
+  },
+  "nonload_bounds": "UNSET_AT_INDEPENDENT_FREEZE",
+  "coordinate_mapping": "UNSET_AT_INDEPENDENT_FREEZE",
+  "design_seed": "UNSET",
+  "root_seed": "UNSET",
+  "n_strata": 32,
+  "load_grid": [
+    0.4,
+    0.6,
+    0.8,
+    1,
+    1.2,
+    1.4,
+    1.6
+  ],
+  "replications": 16,
+  "arms": [
+    "baseline",
+    "capacity_only",
+    "topology_only",
+    "coordination_only",
+    "structural_combined"
+  ],
+  "run_count": 17920,
+  "horizon": "UNSET",
+  "warmup": "UNSET",
+  "baseline_nominal_capacity": "UNSET",
+  "service_distribution_family": "UNSET",
+  "dependency_graph_constructor": "UNSET",
+  "calendar_rule": "UNSET",
+  "physical_resource_policy": "UNSET",
+  "cost_schedule": "UNSET",
+  "crn_streams": "UNSET",
+  "pairability_evidence_sha256": "UNSET",
+  "recovery_evidence_sha256": "UNSET",
+  "verifier_sha256": "UNSET",
+  "output_schema_sha256": "UNSET",
+  "censoring_rule": "UNSET"
+}
