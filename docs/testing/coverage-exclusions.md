@@ -46,7 +46,7 @@ them would require invalidating an already-tested stronger contract.
 | `core/stores.py:400` | Store-item consume helper is only called after caller-level presence checks |
 | `core/engine.py:91` | Engine construction requires a statechart factory |
 | `core/engine.py:129` | Engine construction requires a statechart factory |
-| `core/engine.py:222` | Engine construction requires a statechart factory |
+| `core/engine.py:228` | Engine construction requires a statechart factory |
 | `core/durable.py:77` | Attached durable scheduler requires its due callback |
 | `core/durable.py:204` | Recovery participants are validated for `rebuild_backend()` before reconstruction |
 | `persistence/duckdb.py:132` | Record changes have a closed internal operation set |
