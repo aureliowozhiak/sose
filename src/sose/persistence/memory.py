@@ -133,6 +133,17 @@ class MemoryUnitOfWork:
         value = self._working.boundary_messages.get(message_id)
         return deepcopy(value) if value else None
 
+    def boundary_messages(self) -> tuple[BoundaryMessage, ...]:
+        """Read all messages from the same authoritative UoW snapshot.
+
+        Required for identifying unpaired/duplicated causal publications;
+        looking up messages only through deliveries would hide orphan facts.
+        """
+        return tuple(
+            deepcopy(self._working.boundary_messages[key])
+            for key in sorted(self._working.boundary_messages)
+        )
+
     def save_boundary_message(self, message: BoundaryMessage) -> None:
         existing = self._working.boundary_messages.get(message.message_id)
         if existing is not None and existing != message:
@@ -164,6 +175,13 @@ class MemoryUnitOfWork:
     def get_boundary_consumption(self, delivery_id: str) -> BoundaryConsumption | None:
         value = self._working.boundary_consumptions.get(delivery_id)
         return deepcopy(value) if value else None
+
+    def boundary_consumptions(self) -> tuple[BoundaryConsumption, ...]:
+        """Inspect all ACK receipts from this transactional snapshot."""
+        return tuple(
+            deepcopy(self._working.boundary_consumptions[key])
+            for key in sorted(self._working.boundary_consumptions)
+        )
 
     def save_boundary_consumption(self, consumption: BoundaryConsumption) -> None:
         existing = self._working.boundary_consumptions.get(consumption.delivery_id)
@@ -284,6 +302,13 @@ class MemoryUnitOfWork:
         value = self._working.entities.get((entity_type, entity_id))
         return deepcopy(value) if value else None
 
+    def entities(self) -> tuple[Entity, ...]:
+        """Inspect all entities including orphan observations in this snapshot."""
+        return tuple(
+            deepcopy(self._working.entities[key])
+            for key in sorted(self._working.entities)
+        )
+
     def save_entity(self, entity: Entity) -> None:
         key = (entity.entity_type, entity.id)
         self._working.entities[key] = deepcopy(entity)
@@ -306,6 +331,17 @@ class MemoryUnitOfWork:
     def get_command(self, command_id: str) -> Command | None:
         value = self._working.commands.get(command_id)
         return deepcopy(value) if value else None
+
+    def commands(self) -> tuple[Command, ...]:
+        """Enumerate pending Commands in one authoritative UoW snapshot.
+
+        Required to audit extra executable intents not linked to an expected
+        boundary message. Preserve complete values and deterministic order.
+        """
+        return tuple(
+            deepcopy(self._working.commands[key])
+            for key in sorted(self._working.commands)
+        )
 
     def save_command(self, command: Command) -> None:
         self._working.commands[command.command_id] = deepcopy(command)
