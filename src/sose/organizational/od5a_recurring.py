@@ -104,7 +104,15 @@ def _read_job(
         or job.config_revision != 1
         or job.next_tick != source.attributes["step"]
         or type(job.run_count) is not int
+        # The last real physical action marks the source done in the same
+        # transaction that advances its step and the recurring run_count.
+        # A subsequent completion query consumes no trigger or source step.
         or job.run_count != source.attributes["step"]
+        # The reducer commits terminal source truth with the last real step.
+        # A terminal physical organization can never hold a new active claim.
+        # Enforce this in the common checkpoint reader (before any source
+        # replay OR downstream boundary reconciliation).
+        or (source.attributes["done"] and job.active_trigger_id is not None)
         # Bind the committed trigger identity to the authoritative run count.
         # Equality with a released lease alone is insufficient: forged job
         # and lease IDs could otherwise authorize an invalid replay.
@@ -195,6 +203,43 @@ def _assert_completed_released_lease(
     if _lease_expiry(lease) <= lease.updated_at:
         raise ValueError("OD-5a completed trigger lacks released lease history")
 
+
+
+def _assert_active_claimed_lease(
+    uow: UnitOfWork, job: SimulationJobState,
+) -> None:
+    """Prove claimed source fencing *history* before downstream mutations.
+
+    A claimed worker may have died or its lease expired, yet independently
+    committed physical events still need delivery. Therefore validate its
+    immutable claim identity and lifecycle without requiring a live owner or
+    extending the expired lease. Actual source execution still calls
+    `_assert_claim` with the trusted PostgreSQL clock.
+    """
+    if job.active_trigger_id is None:
+        return
+    lease = uow.get_entity(_LEASE_KIND, job.job_id)
+    if (
+        job.status != "running"
+        or job.phase != "advance"
+        or job.active_trigger_id != _next_trigger_id(job)
+        or lease is None
+        or lease.state != "claimed"
+        or lease.attributes.get("trigger_id") != job.active_trigger_id
+        or not isinstance(lease.attributes.get("owner_id"), str)
+        or not lease.attributes.get("owner_id")
+        or lease.updated_at is None
+        or not isinstance(lease.attributes.get("epoch"), int)
+        or isinstance(lease.attributes.get("epoch"), bool)
+        or lease.attributes["epoch"] < job.run_count + 1
+    ):
+        raise ValueError("OD-5a active lease contradicts runner claim history")
+    try:
+        expiry = _lease_expiry(lease)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("OD-5a active lease contradicts runner claim expiry") from exc
+    if expiry <= lease.updated_at:
+        raise ValueError("OD-5a active lease contradicts runner claim expiry")
 
 
 def _assert_claim(
