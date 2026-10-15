@@ -99,6 +99,7 @@ def dr_participation_id(event_id: str, service_point_id: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -125,6 +126,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -133,6 +135,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     primary_customer_id: str = "customer-1",
     secondary_customer_id: str = "customer-2",
@@ -140,7 +143,7 @@ def seed_reference(
     quantity_kind: str = "energy",
     unit: str = "kWh",
 ) -> EnergyEntities:
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
 
     def create_point(
         ordinal: int,
@@ -938,10 +941,10 @@ def _reconcile_completed_participation(
         )
 
 
-def run_happy_path() -> tuple[MemoryPersistence, EnergyEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, EnergyEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 

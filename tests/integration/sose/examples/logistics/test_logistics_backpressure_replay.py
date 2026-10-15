@@ -15,13 +15,17 @@ from sose.examples.logistics.simulation import (
 from sose.persistence.memory import MemoryPersistence
 
 
+ORGANIZATION_ID = "logistics-backpressure-organization"
+
+
 def _runtime(*, queue_capacity: int = 1):
     persistence = MemoryPersistence()
     entities = seed_reference(
         persistence,
+        owner_id=ORGANIZATION_ID,
         hub_queue_capacity=queue_capacity,
     )
-    _, engine = build_runtime(persistence)
+    _, engine = build_runtime(persistence, owner_id=ORGANIZATION_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     backend.run_until(PICKUP_DUE)
@@ -46,7 +50,7 @@ def test_origin_hub_queue_backpressure_recovers_without_duplicate_arrival():
 
     engine.stores.put(
         backend,
-        store_name="origin_hub_queue",
+        store_name=f"{ORGANIZATION_ID}/origin_hub_queue",
         item_id="origin-blocker",
         value={"shipment_id": "blocker"},
         requested_at=backend.now,
@@ -70,12 +74,12 @@ def test_origin_hub_queue_backpressure_recovers_without_duplicate_arrival():
         if intent.item_id == f"origin-queue:{entities.shipment_id}"
     ]
     assert len(pending_origin) == 1
-    assert pending_origin[0].store_name == "origin_hub_queue"
+    assert pending_origin[0].store_name == f"{ORGANIZATION_ID}/origin_hub_queue"
 
     _drain(
         engine,
         backend,
-        store_name="origin_hub_queue",
+        store_name=f"{ORGANIZATION_ID}/origin_hub_queue",
         request_id="drain-origin-blocker",
     )
 
@@ -106,7 +110,7 @@ def test_destination_queue_backpressure_recovers_after_durable_origin_dequeue():
 
     engine.stores.put(
         backend,
-        store_name="destination_hub_queue",
+        store_name=f"{ORGANIZATION_ID}/destination_hub_queue",
         item_id="destination-blocker",
         value={"shipment_id": "blocker"},
         requested_at=backend.now,
@@ -136,12 +140,12 @@ def test_destination_queue_backpressure_recovers_after_durable_origin_dequeue():
         if intent.item_id == f"destination-queue:{entities.shipment_id}"
     ]
     assert len(pending_destination) == 1
-    assert pending_destination[0].store_name == "destination_hub_queue"
+    assert pending_destination[0].store_name == f"{ORGANIZATION_ID}/destination_hub_queue"
 
     _drain(
         engine,
         backend,
-        store_name="destination_hub_queue",
+        store_name=f"{ORGANIZATION_ID}/destination_hub_queue",
         request_id="drain-destination-blocker",
     )
 
@@ -218,3 +222,41 @@ def test_delivery_dispatch_replay_keeps_single_attempt_and_selection():
         tuple(persistence.resource_reservations()),
     )
     assert after == before
+
+
+def test_destination_put_consumed_immediately_still_completes_transfer(monkeypatch):
+    """A durable queue GET receipt is authoritative even after the item disappears."""
+    persistence, entities, engine, backend = _runtime(queue_capacity=2)
+    assert reconcile_pickup(persistence, engine, backend, entities=entities)
+    assert reconcile_origin_hub(persistence, engine, backend, entities=entities)
+
+    original = engine.stores.ensure_put
+    received = []
+
+    def immediately_deliver_to_consumer(*args, **kwargs):
+        item = original(*args, **kwargs)
+        if kwargs["store_name"] == f"{ORGANIZATION_ID}/destination_hub_queue" and item is not None:
+            receipt = engine.stores.ensure_selection(
+                backend,
+                store_name=f"{ORGANIZATION_ID}/destination_hub_queue",
+                request_id="destination-receiver:one",
+                requested_at=backend.now,
+            )
+            assert receipt is not None
+            received.append(receipt)
+        return item
+
+    monkeypatch.setattr(engine.stores, "ensure_put", immediately_deliver_to_consumer)
+    assert reconcile_transfer(persistence, engine, backend, entities=entities) is True
+
+    shipment = persistence.entity("shipment", entities.shipment_id)
+    assert shipment is not None and shipment.state == "at_destination_hub"
+    item_id = f"destination-queue:{entities.shipment_id}"
+    assert len(received) == 1
+    assert received[0].item.item_id == item_id
+    assert not any(item.item_id == item_id for item in persistence.store_items())
+    assert not any(intent.item_id == item_id for intent in persistence.store_put_intents())
+
+    before = (tuple(persistence.events()), tuple(persistence.store_get_results()))
+    assert reconcile_transfer(persistence, engine, backend, entities=entities) is True
+    assert (tuple(persistence.events()), tuple(persistence.store_get_results())) == before

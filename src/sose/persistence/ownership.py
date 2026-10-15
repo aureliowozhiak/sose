@@ -29,8 +29,13 @@ class FencedEnginePersistence:
             kwargs["writer_scope"] = scope
         return kwargs
 
-    def transaction(self):
-        return self._persistence.transaction(**self._writer_kwargs())
+    def transaction(self, *, owner_id: str | None = None):
+        kwargs = self._writer_kwargs()
+        if owner_id is not None:
+            if not isinstance(owner_id, str) or not owner_id.strip():
+                raise ValueError("owner_id must not be empty")
+            kwargs["owner_id"] = owner_id
+        return self._persistence.transaction(**kwargs)
 
     def boundary_transaction(self):
         factory = getattr(self._persistence, "boundary_transaction", None)

@@ -34,14 +34,14 @@ def test_restarted_r2r_consumer_resumes_committed_journal_without_duplicate(
     original_dispatch = customer.r2r._dispatch
     original_submit = customer.r2r.submit_and_post_journal
 
-    def interrupted_execute(persistence, *, effect_id, fixtures, correlation_id):
+    def interrupted_execute(persistence, *, effect_id, fixtures, correlation_id, organization_id):
         effect = persistence.command(effect_id)
         if cut == "before_r2r" and effect is not None and (
             effect.name == "composition.post_customer_journal"
         ):
             raise RuntimeError("R2R worker died")
         return original_execute(
-            persistence, effect_id=effect_id, fixtures=fixtures, correlation_id=correlation_id,
+            persistence, effect_id=effect_id, fixtures=fixtures, correlation_id=correlation_id, organization_id=organization_id,
         )
 
     def interrupted_dispatch(*args, **kwargs):
@@ -64,7 +64,7 @@ def test_restarted_r2r_consumer_resumes_committed_journal_without_duplicate(
     monkeypatch.setattr(customer.r2r, "_dispatch", interrupted_dispatch)
     monkeypatch.setattr(customer.r2r, "submit_and_post_journal", interrupted_submit)
     with pytest.raises(RuntimeError, match="R2R worker died"):
-        customer.run_customer_demand_path()
+        customer.run_customer_demand_path(organization_id="test-org-r2r-durable-recovery")
     monkeypatch.setattr(customer, "_execute_intent", original_execute)
     monkeypatch.setattr(customer.r2r, "_dispatch", original_dispatch)
     monkeypatch.setattr(customer.r2r, "submit_and_post_journal", original_submit)
@@ -75,7 +75,16 @@ def test_restarted_r2r_consumer_resumes_committed_journal_without_duplicate(
             e for e in store.entities() if e.entity_type == "journal_entry"
         )
         assert journal.state == initial_state
+        with store.transaction() as uow:
+            correlations = {
+                message.correlation_id
+                for delivery in uow.boundary_deliveries()
+                if (message := uow.get_boundary_message(delivery.message_id)) is not None
+            }
+        assert len(correlations) == 1
+        owner_bindings = {next(iter(correlations)): "test-org-r2r-durable-recovery"}
         worker = TradingCustomerRecoveryRunner(
+            organization_owners=owner_bindings,
             persistence=store, owner_id="r2r-restart",
             job_id="r2r-recovery", max_actions=16,
         )

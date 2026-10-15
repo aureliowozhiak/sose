@@ -17,6 +17,15 @@ class CommandFactory:
         self._now = now
         self._tick = tick
         self._sequence = 0
+        self._owner_id: str | None = None
+
+    def bind_owner(self, owner_id: str) -> None:
+        """Bind deterministic command identities to one execution owner."""
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        if self._owner_id is not None and self._owner_id != owner_id:
+            raise ValueError("command factory cannot be rebound to another owner")
+        self._owner_id = owner_id
 
     def create(
         self,
@@ -45,7 +54,11 @@ class CommandFactory:
             cause_id or "root",
             self._sequence,
         )
-        command_id = deterministic_id("command", *identity_parts)
+        identity = (
+            (self._owner_id, *identity_parts)
+            if self._owner_id is not None else identity_parts
+        )
+        command_id = deterministic_id("command", *identity)
         return Command(
             command_id=command_id,
             name=name,
@@ -57,6 +70,7 @@ class CommandFactory:
             payload=merged_payload,
             causation_id=cause_id,
             correlation_id=correlation or command_id,
+            owner_id=self._owner_id,
         )
 
 

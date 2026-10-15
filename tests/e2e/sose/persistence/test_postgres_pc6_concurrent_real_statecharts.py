@@ -79,13 +79,16 @@ def _read_first_failure_snapshot(dsn: str, namespace: str) -> dict[str, object]:
                     if counts.get(key, 0) < 5:
                         identity_sample.append((key, str(record_key), int(record_position)))
                     counts[key] = counts.get(key, 0) + 1
-                position = state.simulation_position
+                positions = state.simulation_positions
                 events = state.events
                 return {
                     "namespace": namespace,
                     "record_identities": identity_sample,
                     "record_identity_count": len(rows),
-                    "position": None if position is None else asdict(position),
+                    "positions": {
+                        owner: asdict(position)
+                        for owner, position in sorted(positions.items())
+                    },
                     "entities": sorted(
                         (entity.entity_type, entity.id, entity.state, entity.version)
                         for entity in state.entities.values()
@@ -147,7 +150,7 @@ def test_pg_two_real_customer_statecharts_overlap_without_business_aliasing(monk
     forensic_lock = Lock()
     original = customer._execute_intent
 
-    def synchronized_first_ingress(persistence, *, effect_id, fixtures, correlation_id):
+    def synchronized_first_ingress(persistence, *, effect_id, fixtures, correlation_id, organization_id):
         command = persistence.command(effect_id)
         if command is not None and command.name == "composition.request_fulfillment_inventory":
             with lock:
@@ -157,7 +160,7 @@ def test_pg_two_real_customer_statecharts_overlap_without_business_aliasing(monk
             arrival.wait(timeout=7)
         return original(
             persistence, effect_id=effect_id, fixtures=fixtures,
-            correlation_id=correlation_id,
+            correlation_id=correlation_id, organization_id=organization_id,
         )
 
     monkeypatch.setattr(customer, "_execute_intent", synchronized_first_ingress)
@@ -166,6 +169,7 @@ def test_pg_two_real_customer_statecharts_overlap_without_business_aliasing(monk
         try:
             with PostgresPersistence(DSN, namespace=namespace) as persistence:
                 return customer.run_customer_demand_path(
+                    organization_id={"customer-a": "org-a", "customer-b": "org-b"}[key],
                     persistence=persistence, instance_key=key,
                 )
         except Exception as error:

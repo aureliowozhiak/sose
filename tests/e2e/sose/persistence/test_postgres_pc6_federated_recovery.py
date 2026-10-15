@@ -51,7 +51,7 @@ def _pool():
 
 def _init_domain(dsn, ns, org):
     with PostgresPersistence(dsn, namespace=ns) as domain:
-        shipment = logistics.seed_reference(domain)
+        shipment = logistics.seed_reference(domain, owner_id=org)
         source = BoundaryMessage.create(
             contract_name="warehouse.dispatch_ready", contract_version=1,
             source_domain="warehouse_fulfillment",
@@ -71,7 +71,7 @@ def _init_domain(dsn, ns, org):
         )
         assert lease is not None
         receipt = boundary.consume(
-            lease=lease, registry=TradingCustomerRecoveryRunner._registry_for(source),
+            lease=lease, registry=TradingCustomerRecoveryRunner._registry_for(source, organization_id=org),
             now=logistics.ORIGIN,
         )
         return (shipment.shipment_id, source.message_id, receipt.consumer_effect_id)
@@ -104,8 +104,9 @@ from sose.persistence.postgres import PostgresPersistence
 from datetime import timedelta
 dsn, domain_ns, resource_ns, org = sys.argv[1:]
 original = TradingCustomerRecoveryRunner._execute_pending
-def killed(store, source, effect_id, *, authoritative_pickup=None, resource_persistence=None):
-    original(store, source, effect_id, authoritative_pickup=authoritative_pickup,
+def killed(store, source, effect_id, *, organization_id, authoritative_pickup=None, resource_persistence=None):
+    original(store, source, effect_id, organization_id=organization_id,
+             authoritative_pickup=authoritative_pickup,
              resource_persistence=resource_persistence)
     assert store.command(effect_id) is None
     assert any(c.effect_id == effect_id for c in store.business_effects())
@@ -272,7 +273,7 @@ def _proof(dsn, domain_names, resource_ns, seeds):
                 "certificate": tuple(certificate),
                 "triggers": tuple(state.completed_batch_triggers),
                 "clock": state.logical_time,
-                "position": domain.simulation_position(),
+                "position": domain.simulation_position(owner_id=org),
             }
     return {"domains": domains, "ledger": ledger, "resource_clocks": clocks}
 

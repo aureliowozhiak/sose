@@ -43,6 +43,7 @@ def flow_correlation_id() -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -62,6 +63,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -126,12 +128,13 @@ def schedule_procurement_cycle(
 def seed_happy_path(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     quantity: float = 10.0,
     schedule: bool = True,
 ) -> P2PEntities:
     _validate_quantity(quantity)
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     correlation_id = flow_correlation_id()
 
     requisition = context.entities.create(
@@ -718,12 +721,13 @@ def _ensure_consumption_side_effects(
 
 def run_happy_path(
     *,
+    owner_id: str,
     quantity: float = 10.0,
 ) -> tuple[MemoryPersistence, P2PEntities]:
     _validate_quantity(quantity)
     persistence = MemoryPersistence()
-    entities = seed_happy_path(persistence, quantity=quantity)
-    _, engine = build_runtime(persistence)
+    entities = seed_happy_path(persistence, owner_id=owner_id, quantity=quantity)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
 
     engine.rebuild_backend(backend)
@@ -756,14 +760,15 @@ def run_happy_path(
 
 def run_shortage_backorder(
     *,
+    owner_id: str,
     quantity: float = 5.0,
 ) -> tuple[MemoryPersistence, P2PEntities]:
     """Exercise durable shortage waiting followed by exact-once replenishment."""
 
     _validate_quantity(quantity)
     persistence = MemoryPersistence()
-    entities = seed_happy_path(persistence, quantity=quantity)
-    context, engine = build_runtime(persistence)
+    entities = seed_happy_path(persistence, owner_id=owner_id, quantity=quantity)
+    context, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 

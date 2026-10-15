@@ -45,8 +45,8 @@ class _State:
     events: list[DomainEvent] = field(default_factory=list)
     commands: dict[str, Command] = field(default_factory=dict)
     scheduled_work: dict[str, ScheduledWork] = field(default_factory=dict)
-    simulation_position: SimulationPosition | None = None
-    scenario_state: ScenarioRuntimeState | None = None
+    simulation_positions: dict[str, SimulationPosition] = field(default_factory=dict)
+    scenario_states: dict[str, ScenarioRuntimeState] = field(default_factory=dict)
     resource_definitions: dict[str, ResourceDefinition] = field(default_factory=dict)
     resource_demands: dict[str, ResourceDemand] = field(default_factory=dict)
     resource_reservations: dict[str, ResourceReservation] = field(default_factory=dict)
@@ -74,7 +74,7 @@ class _State:
     business_effects: dict[str, BusinessEffectApplied] = field(default_factory=dict)
     customer_settlement_bindings: dict[tuple[str, str], CustomerSettlementBinding] = field(default_factory=dict)
     domain_deliveries: dict[str, DomainDelivery] = field(default_factory=dict)
-    committed_tick: int = -1
+    committed_ticks: dict[str, int] = field(default_factory=dict)
 
 
 def fork_state(state: _State) -> _State:
@@ -325,6 +325,8 @@ class MemoryUnitOfWork:
         return deepcopy(matches[0]) if matches else None
 
     def append_event(self, event: DomainEvent) -> None:
+        if not isinstance(event.owner_id, str) or not event.owner_id.strip():
+            raise ValueError("durable domain event requires operational owner_id")
         self._working.events.append(deepcopy(event))
         self._mark_dirty("events", len(self._working.events) - 1)
 
@@ -368,13 +370,27 @@ class MemoryUnitOfWork:
         self._working.scheduled_work.pop(work_id, None)
         self._mark_dirty("scheduled_work", work_id)
 
-    def set_simulation_position(self, position: SimulationPosition) -> None:
-        self._working.simulation_position = deepcopy(position)
-        self._mark_dirty("simulation_position", "__scalar__")
+    def get_simulation_position(self, *, owner_id: str) -> SimulationPosition | None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        return deepcopy(self._working.simulation_positions.get(owner_id))
 
-    def set_scenario_state(self, state: ScenarioRuntimeState) -> None:
-        self._working.scenario_state = deepcopy(state)
-        self._mark_dirty("scenario_state", "__scalar__")
+    def set_simulation_position(self, position: SimulationPosition, *, owner_id: str) -> None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        self._working.simulation_positions[owner_id] = deepcopy(position)
+        self._mark_dirty("simulation_positions", owner_id)
+
+    def get_scenario_state(self, *, owner_id: str) -> ScenarioRuntimeState | None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        return deepcopy(self._working.scenario_states.get(owner_id))
+
+    def set_scenario_state(self, state: ScenarioRuntimeState, *, owner_id: str) -> None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        self._working.scenario_states[owner_id] = deepcopy(state)
+        self._mark_dirty("scenario_states", owner_id)
 
     def get_resource_demand(self, request_id: str) -> ResourceDemand | None:
         value = self._working.resource_demands.get(request_id)
@@ -724,9 +740,11 @@ class MemoryUnitOfWork:
         self._working.resource_preemption_results[result.result_id] = deepcopy(result)
         self._mark_dirty("resource_preemption_results", result.result_id)
 
-    def set_committed_tick(self, tick: int) -> None:
-        self._working.committed_tick = tick
-        self._mark_dirty("committed_tick", "__scalar__")
+    def set_committed_tick(self, tick: int, *, owner_id: str) -> None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        self._working.committed_ticks[owner_id] = tick
+        self._mark_dirty("committed_ticks", owner_id)
 
     def commit(self) -> None:
         store_overlap = (
@@ -760,7 +778,9 @@ class MemoryPersistence:
         self._state = _State()
 
     @contextmanager
-    def transaction(self) -> Iterator[MemoryUnitOfWork]:
+    def transaction(self, *, owner_id: str | None = None) -> Iterator[MemoryUnitOfWork]:
+        if owner_id is not None and not owner_id:
+            raise ValueError("owner_id must not be empty")
         uow = MemoryUnitOfWork(fork_state(self._state), self)
         try:
             yield uow
@@ -842,8 +862,10 @@ class MemoryPersistence:
             if job_id is None or checkpoint.job_id == job_id
         )
 
-    def committed_tick(self) -> int:
-        return self._state.committed_tick
+    def committed_tick(self, *, owner_id: str) -> int:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        return self._state.committed_ticks.get(owner_id, -1)
 
     def events(self) -> tuple[DomainEvent, ...]:
         return tuple(deepcopy(self._state.events))
@@ -865,11 +887,15 @@ class MemoryPersistence:
     def due_scheduled_work(self, at: datetime) -> tuple[ScheduledWork, ...]:
         return tuple(work for work in self.scheduled_work() if work.due_at <= at)
 
-    def simulation_position(self) -> SimulationPosition | None:
-        return deepcopy(self._state.simulation_position)
+    def simulation_position(self, *, owner_id: str) -> SimulationPosition | None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        return deepcopy(self._state.simulation_positions.get(owner_id))
 
-    def scenario_state(self) -> ScenarioRuntimeState | None:
-        return deepcopy(self._state.scenario_state)
+    def scenario_state(self, *, owner_id: str) -> ScenarioRuntimeState | None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        return deepcopy(self._state.scenario_states.get(owner_id))
 
     def resource_definitions(self) -> tuple[ResourceDefinition, ...]:
         return tuple(

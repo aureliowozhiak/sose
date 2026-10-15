@@ -21,6 +21,7 @@ def test_scheduled_work_round_trips_through_persistence():
         priority=10,
         sequence=3,
         command_id=cmd.command_id,
+        owner_id="test-test_durable_runtime",
     )
 
     with store.transaction() as uow:
@@ -39,9 +40,9 @@ def test_scheduled_work_order_is_time_priority_then_sequence():
 
     with store.transaction() as uow:
         for cmd, work in (
-            (later, ScheduledWork("w-later", later.due_at, 100, 1, later.command_id)),
-            (low, ScheduledWork("w-low", low.due_at, 100, 2, low.command_id)),
-            (high, ScheduledWork("w-high", high.due_at, 10, 3, high.command_id)),
+            (later, ScheduledWork("w-later", later.due_at, 100, 1, later.command_id, owner_id="test-test_durable_runtime")),
+            (low, ScheduledWork("w-low", low.due_at, 100, 2, low.command_id, owner_id="test-test_durable_runtime")),
+            (high, ScheduledWork("w-high", high.due_at, 10, 3, high.command_id, owner_id="test-test_durable_runtime")),
         ):
             uow.save_command(cmd)
             uow.save_scheduled_work(work)
@@ -55,7 +56,7 @@ def test_scheduled_work_order_is_time_priority_then_sequence():
 def test_transaction_can_atomically_consume_work_and_commit_position():
     store = MemoryPersistence()
     cmd = command("cmd-1", ORIGIN)
-    work = ScheduledWork("work-1", ORIGIN, 100, 1, cmd.command_id)
+    work = ScheduledWork("work-1", ORIGIN, 100, 1, cmd.command_id, owner_id="test-test_durable_runtime")
     position = SimulationPosition(
         logical_time=ORIGIN,
         execution_sequence=7,
@@ -69,17 +70,17 @@ def test_transaction_can_atomically_consume_work_and_commit_position():
     with store.transaction() as uow:
         uow.delete_scheduled_work(work.work_id)
         uow.delete_command(cmd.command_id)
-        uow.set_simulation_position(position)
+        uow.set_simulation_position(position, owner_id="test-test_durable_runtime")
 
     assert store.scheduled_work() == ()
     assert store.command(cmd.command_id) is None
-    assert store.simulation_position() == position
+    assert store.simulation_position(owner_id="test-test_durable_runtime") == position
 
 
 def test_rollback_restores_scheduled_work_and_position():
     store = MemoryPersistence()
     cmd = command("cmd-1", ORIGIN)
-    work = ScheduledWork("work-1", ORIGIN, 100, 1, cmd.command_id)
+    work = ScheduledWork("work-1", ORIGIN, 100, 1, cmd.command_id, owner_id="test-test_durable_runtime")
 
     with store.transaction() as uow:
         uow.save_command(cmd)
@@ -90,7 +91,8 @@ def test_rollback_restores_scheduled_work_and_position():
             uow.delete_scheduled_work(work.work_id)
             uow.delete_command(cmd.command_id)
             uow.set_simulation_position(
-                SimulationPosition(ORIGIN, execution_sequence=1, committed_sequence=1)
+                SimulationPosition(ORIGIN, execution_sequence=1, committed_sequence=1),
+                owner_id="test-test_durable_runtime",
             )
             raise RuntimeError("crash before commit")
     except RuntimeError:
@@ -98,4 +100,4 @@ def test_rollback_restores_scheduled_work_and_position():
 
     assert store.scheduled_work() == (work,)
     assert store.command(cmd.command_id) == cmd
-    assert store.simulation_position() is None
+    assert store.simulation_position(owner_id="test-test_durable_runtime") is None

@@ -25,6 +25,15 @@ PICKUP_DUE = ORIGIN + timedelta(hours=1)
 RETRY_DELAY = timedelta(hours=2)
 
 
+def _organization_queue(owner_id: str, queue: str) -> str:
+    """Physical Store names are owner-qualified; independent FIFO heads cannot alias."""
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        raise ValueError("store queue owner_id must not be empty")
+    if queue not in {"origin_hub_queue", "destination_hub_queue"}:
+        raise ValueError("unknown Logistics queue")
+    return f"{owner_id}/{queue}"
+
+
 @dataclass(frozen=True, slots=True)
 class LogisticsEntities:
     shipment_id: str
@@ -49,6 +58,7 @@ def delivery_attempt_id(ordinal: int, *, shipment_id: str | None = None) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -66,6 +76,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -74,6 +85,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     service_level: str = "standard",
     route: str = "origin-a:destination-b",
@@ -84,7 +96,7 @@ def seed_reference(
 ) -> LogisticsEntities:
     if instance_key is not None and (not isinstance(instance_key, str) or not instance_key.strip()):
         raise ValueError("instance_key must be a nonempty string")
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     shipment = context.entities.create(
         Shipment,
         key=(("logistics-reference", "shipment-1") if instance_key is None
@@ -103,9 +115,9 @@ def seed_reference(
         ):
             uow.save_resource_definition(ResourceDefinition(name, capacity=resource_capacity))
 
-    engine.stores.define(StoreDefinition("origin_hub_queue", kind="fifo", capacity=hub_queue_capacity))
+    engine.stores.define(StoreDefinition(_organization_queue(owner_id, "origin_hub_queue"), kind="fifo", capacity=hub_queue_capacity))
     engine.stores.define(
-        StoreDefinition("destination_hub_queue", kind="fifo", capacity=hub_queue_capacity)
+        StoreDefinition(_organization_queue(owner_id, "destination_hub_queue"), kind="fifo", capacity=hub_queue_capacity)
     )
 
     command = context.commands.create(
@@ -274,7 +286,7 @@ def reconcile_origin_hub(
     if not any(item.item_id == item_id for item in persistence.store_items()):
         engine.stores.put(
             backend,
-            store_name="origin_hub_queue",
+            store_name=_organization_queue(engine.owner_id, "origin_hub_queue"),
             item_id=item_id,
             value={"shipment_id": shipment.id},
             requested_at=backend.now,
@@ -322,7 +334,7 @@ def _ensure_origin_queue_dequeue(
     if not _has_store_get_request(persistence, dequeue_id):
         engine.stores.get(
             backend,
-            store_name="origin_hub_queue",
+            store_name=_organization_queue(engine.owner_id, "origin_hub_queue"),
             request_id=dequeue_id,
             requested_at=backend.now,
         )
@@ -343,7 +355,7 @@ def _ensure_destination_queue_dequeue(
     if not _has_store_get_request(persistence, dequeue_id):
         engine.stores.get(
             backend,
-            store_name="destination_hub_queue",
+            store_name=_organization_queue(engine.owner_id, "destination_hub_queue"),
             request_id=dequeue_id,
             requested_at=backend.now,
         )
@@ -401,17 +413,35 @@ def reconcile_transfer(
         return False
 
     item_id = f"destination-queue:{shipment.id}"
-    if not any(item.item_id == item_id for item in persistence.store_items()):
-        engine.stores.put(
+    destination_queue = _organization_queue(
+        engine.owner_id, "destination_hub_queue",
+    )
+    if not any(
+        item.item_id == item_id and item.store_name == destination_queue
+        for item in persistence.store_items()
+    ):
+        # Reuse the exact pending PUT after finite-queue backpressure.
+        engine.stores.ensure_put(
             backend,
-            store_name="destination_hub_queue",
+            store_name=destination_queue,
             item_id=item_id,
             value={"shipment_id": shipment.id},
             requested_at=backend.now,
         )
         backend.run_until(backend.now)
 
-    if not any(item.item_id == item_id for item in persistence.store_items()):
+    # A concurrent consumer may have accepted and removed the item already.
+    # Its durable receipt is equivalent to a live destination-queue item.
+    destination_available = any(
+        item.item_id == item_id and item.store_name == destination_queue
+        for item in persistence.store_items()
+    )
+    destination_consumed = any(
+        result.item.item_id == item_id
+        and result.store_name == destination_queue
+        for result in persistence.store_get_results()
+    )
+    if not destination_available and not destination_consumed:
         return False
 
     shipment = _shipment(persistence, entities)
@@ -676,10 +706,10 @@ def reconcile_delivery_failure(
     return due_at
 
 
-def run_happy_path() -> tuple[MemoryPersistence, LogisticsEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, LogisticsEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 
@@ -700,10 +730,10 @@ def run_happy_path() -> tuple[MemoryPersistence, LogisticsEntities]:
     return persistence, entities
 
 
-def run_failed_retry_path() -> tuple[MemoryPersistence, LogisticsEntities]:
+def run_failed_retry_path(*, owner_id: str) -> tuple[MemoryPersistence, LogisticsEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 

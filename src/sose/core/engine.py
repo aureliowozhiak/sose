@@ -40,7 +40,13 @@ class Engine:
         scenarios: Iterable[Scenario] = (),
         store_filters=None,
         domain_warehouse: DomainWarehouse | None = None,
+        owner_id: str,
     ) -> None:
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must not be empty")
+        self.owner_id = owner_id
+        context.commands.bind_owner(owner_id)
+        context.events.bind_owner(owner_id)
         self.context = context
         self.registry = registry
         self.persistence = persistence
@@ -55,7 +61,7 @@ class Engine:
         self.preemptive_resources = DurablePreemptiveResourceManager(persistence)
         self.stores = DurableStoreManager(persistence, filters=store_filters)
         self.containers = DurableContainerManager(persistence)
-        self.scheduler = DurableScheduler(persistence)
+        self.scheduler = DurableScheduler(persistence, owner_id=owner_id)
         self.context.schedules.bind_scheduler(self.scheduler)
         self.context.scenarios.register_many(scenarios)
         self.context.bind_statecharts(registry)
@@ -81,9 +87,11 @@ class Engine:
             uow.save_domain_delivery(DomainDelivery(mutation))
 
     def dispatch(self, command: Command) -> None:
+        if command.owner_id != self.owner_id:
+            raise PermissionError("command belongs to a different or missing owner")
         scenario_before = self.context.scenarios.snapshot_state()
         try:
-            with self.persistence.transaction() as uow:
+            with self.persistence.transaction(owner_id=self.owner_id) as uow:
                 entity = self._load_entity(uow, command.entity_type, command.entity_id)
                 if entity is None:
                     raise KeyError(f"entity not found: {command.entity_type}/{command.entity_id}")
@@ -98,7 +106,7 @@ class Engine:
                 for event in emitted:
                     uow.append_event(event)
                     self.context.scenarios.on_event(event)
-                uow.set_scenario_state(self.context.scenarios.snapshot_state())
+                uow.set_scenario_state(self.context.scenarios.snapshot_state(), owner_id=self.owner_id)
         except Exception:
             self.context.scenarios.restore_state(scenario_before)
             raise
@@ -109,6 +117,10 @@ class Engine:
 
         command = item.command
         work = item.work
+        if command.owner_id != self.owner_id:
+            raise PermissionError("command belongs to a different or missing owner")
+        if work.owner_id != self.owner_id:
+            raise PermissionError("scheduled work belongs to a different owner")
         if command.command_id != work.command_id:
             raise ValueError("scheduled work does not match command")
         if work.due_at != command.due_at:
@@ -136,7 +148,7 @@ class Engine:
         for event in emitted:
             uow.append_event(event)
             self.context.scenarios.on_event(event)
-        uow.set_scenario_state(self.context.scenarios.snapshot_state())
+        uow.set_scenario_state(self.context.scenarios.snapshot_state(), owner_id=self.owner_id)
 
         uow.delete_scheduled_work(work.work_id)
         uow.delete_command(command.command_id)
@@ -148,17 +160,21 @@ class Engine:
         Returns False for an already-consumed stale callback so backend duplication
         cannot replay a committed transition.
         """
+        if item.work.owner_id != self.owner_id:
+            raise PermissionError("scheduled work belongs to a different owner")
+        if item.command.owner_id != self.owner_id:
+            raise PermissionError("command belongs to a different or missing owner")
 
         previous_time = self.context.clock.now
         previous_tick = self.context.clock.tick
         scenario_before = self.context.scenarios.snapshot_state()
         pending_before = list(self.context.pending_events)
         try:
-            with self.persistence.transaction() as uow:
+            with self.persistence.transaction(owner_id=self.owner_id) as uow:
                 if not self._dispatch_scheduled_in_uow(item, uow):
                     return False
 
-                previous = self.persistence.simulation_position()
+                previous = uow.get_simulation_position(owner_id=self.owner_id)
                 next_sequence = 1 if previous is None else previous.execution_sequence + 1
                 uow.set_simulation_position(
                     SimulationPosition(
@@ -166,7 +182,8 @@ class Engine:
                         execution_sequence=next_sequence,
                         committed_sequence=next_sequence,
                         logical_tick=self.context.clock.tick,
-                    )
+                    ),
+                    owner_id=self.owner_id,
                 )
         except Exception:
             self.context.clock.now = previous_time
@@ -180,7 +197,7 @@ class Engine:
 
     def diagnostics(self) -> RuntimeDiagnostics:
         """Return a read-only snapshot of durable runtime state and warnings."""
-        return collect_runtime_diagnostics(self.persistence)
+        return collect_runtime_diagnostics(self.persistence, owner_id=self.owner_id)
 
 
     def rebuild_backend(self, backend) -> int:
@@ -190,6 +207,7 @@ class Engine:
         rebuilt = RuntimeRebuilder(
             self.persistence,
             context=self.context,
+            owner_id=self.owner_id,
             # A local domain must never dispatch scheduled work owned by
             # another domain's StateChart. The foreign durable Command/work
             # remain untouched for their proper domain runtime.
@@ -301,9 +319,12 @@ class Engine:
         current_tick = self.context.clock.tick
         next_tick = current_tick + 1
 
+        if len(self.context.scheduler):
+            # No legacy callback may trigger before the owner fence.
+            raise RuntimeError("unowned in-memory scheduling is not supported")
         scenario_before = self.context.scenarios.snapshot_state()
         pending_before = list(self.context.pending_events)
-        position_before = self.persistence.simulation_position()
+        position_before = self.persistence.simulation_position(owner_id=self.owner_id)
         execution_sequence = (
             0 if position_before is None else position_before.execution_sequence
         )
@@ -314,13 +335,10 @@ class Engine:
         try:
             self.context.scenarios.on_tick()
 
-            # The legacy in-memory scheduler is retained only as a compatibility
-            # bridge. Engine-bound ScheduleFactory instances use DurableScheduler.
-            for command in self.context.scheduler.due(tick_start):
-                self.dispatch(command)
-
-            with self.persistence.transaction() as uow:
-                uow.set_scenario_state(self.context.scenarios.snapshot_state())
+            with self.persistence.transaction(owner_id=self.owner_id) as uow:
+                if uow.get_simulation_position(owner_id=self.owner_id) != position_before:
+                    raise RuntimeError("stale owner simulation position at tick admission")
+                uow.set_scenario_state(self.context.scenarios.snapshot_state(), owner_id=self.owner_id)
 
                 executed = 0
                 for item in self.scheduler.due(tick_end):
@@ -328,14 +346,15 @@ class Engine:
                         executed += 1
 
                 next_sequence = execution_sequence + executed
-                uow.set_committed_tick(current_tick)
+                uow.set_committed_tick(current_tick, owner_id=self.owner_id)
                 uow.set_simulation_position(
                     SimulationPosition(
                         logical_time=tick_end,
                         execution_sequence=next_sequence,
                         committed_sequence=next_sequence,
                         logical_tick=next_tick,
-                    )
+                    ),
+                    owner_id=self.owner_id,
                 )
         except Exception:
             self.context.clock.now = tick_start

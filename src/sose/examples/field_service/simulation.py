@@ -69,6 +69,7 @@ def visit_id(appointment_id_value: str, sequence: int) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -88,6 +89,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
         store_filters={PART_FILTER_KEY: _required_part_filter},
@@ -97,6 +99,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     territory: str = REQUIRED_TERRITORY,
     required_skill: str = REQUIRED_SKILL,
@@ -104,7 +107,7 @@ def seed_reference(
     technician_resource_capacity: int = 1,
     parts_store_capacity: int = 20,
 ) -> FieldServiceEntities:
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     work_order = context.entities.create(
         WorkOrder,
         key=("field-service-reference", "installation-1"),
@@ -796,10 +799,10 @@ def record_visit(
     return _entity(persistence, "field_visit_occurrence", visit.id)
 
 
-def run_happy_path() -> tuple[MemoryPersistence, FieldServiceEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, FieldServiceEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     seed_part_inventory(persistence, engine, backend)

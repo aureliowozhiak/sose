@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from collections.abc import Mapping
 from math import isfinite
 from time import monotonic, sleep
 
@@ -38,6 +39,31 @@ class DurableResourceWait(RuntimeError):
         super().__init__(f"physical resource still pending: {resource_name} / {request_id}")
 
 
+
+def _raise_delivery_dispatch_failure_or_wait(
+    persistence: MemoryPersistence, *, shipment_id: str, ordinal: int,
+) -> None:
+    """Distinguish a genuine finite courier wait from an unexplained false.
+
+    The exact request must still be an ungranted, durable delivery-courier
+    demand. In particular, a granted reservation or an unrelated business
+    failure must never be reclassified as transient contention.
+    """
+    attempt_id = logistics.delivery_attempt_id(ordinal, shipment_id=shipment_id)
+    request_id = f"delivery-courier:{attempt_id}"
+    pending = any(
+        demand.request_id == request_id and demand.resource_name == "delivery_courier"
+        for demand in persistence.resource_demands()
+    )
+    granted = any(
+        reservation.request_id == request_id
+        for reservation in persistence.resource_reservations()
+    )
+    if pending and not granted:
+        raise DurableResourceWait("delivery_courier", request_id)
+    raise RuntimeError("logistics delivery dispatch failed")
+
+
 @dataclass(frozen=True, slots=True)
 class CustomerDemandPathResult:
     persistence: MemoryPersistence
@@ -69,7 +95,11 @@ def _intent_handler(
     intent_name: str,
     entity_type: str,
     entity_id: str,
+    owner_id: str,
 ):
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        raise ValueError("composition intent requires operational owner_id")
+
     def handle(message: BoundaryMessage, uow) -> str:
         command_id = deterministic_id(
             "composition-domain-intent",
@@ -92,6 +122,7 @@ def _intent_handler(
             },
             causation_id=message.message_id,
             correlation_id=message.correlation_id,
+            owner_id=owner_id,
         )
         existing = uow.get_command(command_id)
         if existing is not None and existing != command:
@@ -103,7 +134,7 @@ def _intent_handler(
     return handle
 
 
-def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
+def _registry(fixtures: _CustomerFixtures, *, owner_id: str) -> BoundaryConsumerRegistry:
     registry = BoundaryConsumerRegistry()
     registry.register(
         destination_domain="warehouse_fulfillment",
@@ -113,6 +144,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.request_fulfillment_inventory",
             entity_type="warehouse_fulfillment_order",
             entity_id=fixtures.fulfillment.order_id,
+            owner_id=owner_id,
         ),
     )
     registry.register(
@@ -123,6 +155,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.request_fulfillment_inventory",
             entity_type="warehouse_fulfillment_order",
             entity_id=fixtures.fulfillment.order_id,
+            owner_id=owner_id,
         ),
     )
     registry.register(
@@ -133,6 +166,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.reserve_fulfillment_inventory",
             entity_type="warehouse_management_stock",
             entity_id=fixtures.warehouse.origin_stock_id,
+            owner_id=owner_id,
         ),
     )
     registry.register(
@@ -143,6 +177,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.accept_inventory_reservation",
             entity_type="warehouse_fulfillment_order",
             entity_id=fixtures.fulfillment.order_id,
+            owner_id=owner_id,
         ),
     )
     registry.register(
@@ -153,6 +188,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.consume_fulfillment_inventory",
             entity_type="warehouse_management_stock",
             entity_id=fixtures.warehouse.origin_stock_id,
+            owner_id=owner_id,
         ),
     )
     registry.register(
@@ -163,6 +199,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.deliver_shipment",
             entity_type="shipment",
             entity_id=fixtures.logistics.shipment_id,
+            owner_id=owner_id,
         ),
     )
     registry.register(
@@ -173,6 +210,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.complete_external_fulfillment",
             entity_type="sales_order",
             entity_id=fixtures.o2c.order_id,
+            owner_id=owner_id,
         ),
     )
     registry.register(
@@ -183,6 +221,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.settle_customer_payment",
             entity_type="card_payment",
             entity_id=fixtures.payments.payment_id,
+            owner_id=owner_id,
         ),
     )
     registry.register(
@@ -193,6 +232,7 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
             intent_name="composition.post_customer_journal",
             entity_type="journal_entry",
             entity_id=fixtures.r2r.journal_id,
+            owner_id=owner_id,
         ),
     )
     return registry
@@ -201,9 +241,11 @@ def _registry(fixtures: _CustomerFixtures) -> BoundaryConsumerRegistry:
 def _next_logical_time(
     persistence: MemoryPersistence,
     previous: datetime,
+    *,
+    organization_id: str,
 ) -> datetime:
     candidate = previous + timedelta(minutes=1)
-    position = persistence.simulation_position()
+    position = persistence.simulation_position(owner_id=organization_id)
     if position is not None and position.logical_time > candidate:
         return position.logical_time
     return candidate
@@ -301,8 +343,10 @@ def _causal_command_scope(engine, *, intent: Command, correlation_id: str):
 def _recovery_time(
     persistence: MemoryPersistence,
     requested_at: datetime,
+    *,
+    organization_id: str,
 ) -> datetime:
-    position = persistence.simulation_position()
+    position = persistence.simulation_position(owner_id=organization_id)
     if position is None:
         return requested_at
     if requested_at < position.logical_time:
@@ -339,6 +383,7 @@ def _dispatch_o2c_event(
         payload=command.payload,
         causation_id=causation_id,
         correlation_id=correlation_id,
+        owner_id=command.owner_id,
     )
     engine.dispatch(command)
 
@@ -348,6 +393,7 @@ def _materialize_fulfillment_from_request(
     *,
     intent: Command,
     expected_sales_order_id: str,
+    organization_id: str,
 ) -> fulfillment.WarehouseEntities:
     """Derive composed WF business state from immutable O2C payload, never a fixture."""
     payload = intent.payload
@@ -403,6 +449,7 @@ def _materialize_fulfillment_from_request(
 
     created = fulfillment.seed_composed_reference(
         persistence,
+        owner_id=organization_id,
         now=intent.due_at,
         requested_quantity=float(quantity),
         requested_sku=sku,
@@ -413,12 +460,19 @@ def _materialize_fulfillment_from_request(
     return created
 
 
-def pickup_resource_due_at(persistence: MemoryPersistence, intent: Command) -> datetime:
+def pickup_resource_due_at(
+    persistence: MemoryPersistence,
+    intent: Command,
+    *,
+    organization_id: str,
+) -> datetime:
+    if not isinstance(organization_id, str) or not organization_id.strip():
+        raise ValueError("organization_id must not be empty")
     """Resolve the earliest physical pickup time from durable domain state."""
     shipment = persistence.entity("shipment", intent.entity_id)
     if shipment is None:
         raise RuntimeError("pickup demand references a missing shipment")
-    position = persistence.simulation_position()
+    position = persistence.simulation_position(owner_id=organization_id)
     anchor = max(
         intent.due_at,
         position.logical_time if position is not None else intent.due_at,
@@ -444,7 +498,10 @@ def _execute_intent(
     correlation_id: str,
     authoritative_pickup: TemporalReservation | None = None,
     resource_persistence: MemoryPersistence | None = None,
+    organization_id: str,
 ) -> None:
+    if not isinstance(organization_id, str) or not organization_id.strip():
+        raise ValueError("organization_id must not be empty")
     intent = persistence.command(effect_id)
     if intent is None:
         return
@@ -461,7 +518,9 @@ def _execute_intent(
 
     if intent.name == "composition.request_fulfillment_inventory":
         order_ref = _materialize_fulfillment_from_request(
-            persistence, intent=intent, expected_sales_order_id=fixtures.o2c.order_id
+            persistence, intent=intent,
+            expected_sales_order_id=fixtures.o2c.order_id,
+            organization_id=organization_id,
         )
         if order_ref.order_id != fixtures.fulfillment.order_id:
             raise ValueError("composed fulfillment request differs from current workflow")
@@ -470,7 +529,7 @@ def _execute_intent(
             raise RuntimeError("inventory reservation requires requested fulfillment order")
 
     elif intent.name == "composition.reserve_fulfillment_inventory":
-        _, engine = wm.build_runtime(persistence, now=intent.due_at)
+        _, engine = wm.build_runtime(persistence, owner_id=organization_id, now=intent.due_at)
         applied = wm.reserve_external_stock(
             persistence,
             engine,
@@ -495,7 +554,7 @@ def _execute_intent(
                 raise RuntimeError("warehouse management inventory reservation failed")
 
     elif intent.name == "composition.accept_inventory_reservation":
-        _, engine = fulfillment.build_runtime(persistence, now=intent.due_at)
+        _, engine = fulfillment.build_runtime(persistence, owner_id=organization_id, now=intent.due_at)
         with _causal_command_scope(
             engine,
             intent=intent,
@@ -525,6 +584,7 @@ def _execute_intent(
             # already-durable dispatch message after WM has consumed stock.
             picked_messages = reconcile_shipped_fulfillment_egress(
                 persistence, correlation_id=correlation_id,
+                organization_owners={correlation_id: organization_id},
             )
             if not picked_messages or picked_messages[0].contract_key != (
                 "warehouse.inventory_consumption_requested.v1"
@@ -548,7 +608,7 @@ def _execute_intent(
                 raise RuntimeError("composed fulfillment cannot resume terminal shipment")
 
     elif intent.name == "composition.consume_fulfillment_inventory":
-        _, engine = wm.build_runtime(persistence, now=intent.due_at)
+        _, engine = wm.build_runtime(persistence, owner_id=organization_id, now=intent.due_at)
         # False means the same reservation/consumption reference was already
         # durably applied; that is a successful idempotent retry after a crash.
         wm.consume_external_reservation(
@@ -570,10 +630,10 @@ def _execute_intent(
         shipment = persistence.entity("shipment", shipment_id)
         if shipment is None:
             raise RuntimeError("logistics shipment disappeared")
-        position = persistence.simulation_position()
+        position = persistence.simulation_position(owner_id=organization_id)
         restore_at = position.logical_time if position is not None else intent.due_at
         recovery_time = max(restore_at, intent.due_at)
-        _, engine = logistics.build_runtime(persistence, now=restore_at)
+        _, engine = logistics.build_runtime(persistence, owner_id=organization_id, now=restore_at)
         backend = SimPyBackend(origin=restore_at)
 
         with _causal_command_scope(
@@ -676,9 +736,73 @@ def _execute_intent(
                     raise RuntimeError("logistics origin-hub handling failed")
 
             if current_state() in {"at_origin_hub", "in_transfer"}:
+                # Resource identities are physical; queue identities remain
+                # scoped to the owning organization.
+                waiting_resources = (
+                    ("transfer_vehicle", f"transfer-vehicle:{shipment_id}"),
+                    ("destination_dock", f"destination-dock:{shipment_id}"),
+                )
+                preexisting_grants = {
+                    request_id: engine.resources.reservation_for(request_id)
+                    for _, request_id in waiting_resources
+                }
                 if not logistics.reconcile_transfer(
                     persistence, engine, backend, entities=fixtures.logistics,
                 ):
+                    for resource_name, request_id in waiting_resources:
+                        current_grant = engine.resources.reservation_for(request_id)
+                        if engine.resources.has_request(request_id) and (
+                            current_grant is None
+                            or preexisting_grants[request_id] is None
+                        ):
+                            raise DurableResourceWait(resource_name, request_id)
+
+                    origin_queue = logistics._organization_queue(
+                        organization_id, "origin_hub_queue",
+                    )
+                    destination_queue = logistics._organization_queue(
+                        organization_id, "destination_hub_queue",
+                    )
+                    origin_request = f"origin-dequeue:{shipment_id}"
+                    destination_id = f"destination-queue:{shipment_id}"
+                    if any(
+                        request.request_id == origin_request
+                        and request.store_name == origin_queue
+                        for request in persistence.store_get_requests()
+                    ):
+                        raise DurableResourceWait(origin_queue, origin_request)
+                    if any(
+                        intent_record.item_id == destination_id
+                        and intent_record.store_name == destination_queue
+                        for intent_record in persistence.store_put_intents()
+                    ):
+                        raise DurableResourceWait(destination_queue, destination_id)
+
+                    # A worker can commit a dequeue/put after the local
+                    # reconciliation returned False. Only exact matching
+                    # durable receipts justify retrying the original Command.
+                    if current_state() == "at_origin_hub":
+                        selection = engine.stores.selection(origin_request)
+                        if (
+                            selection is not None
+                            and selection.store_name == origin_queue
+                            and selection.item.item_id == f"origin-queue:{shipment_id}"
+                        ):
+                            raise DurableResourceWait(origin_queue, origin_request)
+                    if current_state() == "in_transfer" and (
+                        any(
+                            item.item_id == destination_id
+                            and item.store_name == destination_queue
+                            for item in persistence.store_items()
+                        )
+                        or any(
+                            result.item.item_id == destination_id
+                            and result.store_name == destination_queue
+                            for result in persistence.store_get_results()
+                        )
+                    ):
+                        raise DurableResourceWait(destination_queue, destination_id)
+                    # No exact durable evidence means a genuine domain failure.
                     raise RuntimeError("logistics transfer failed")
 
             if current_state() in {"at_destination_hub", "delayed_destination_hub"}:
@@ -686,7 +810,9 @@ def _execute_intent(
                     persistence, engine, backend, entities=fixtures.logistics,
                     ordinal=1,
                 ):
-                    raise RuntimeError("logistics delivery dispatch failed")
+                    _raise_delivery_dispatch_failure_or_wait(
+                        persistence, shipment_id=shipment_id, ordinal=1,
+                    )
 
             if current_state() == "out_for_delivery":
                 attempt = persistence.entity(
@@ -715,7 +841,7 @@ def _execute_intent(
                 )
 
     elif intent.name == "composition.complete_external_fulfillment":
-        _, engine = o2c.build_runtime(persistence, now=intent.due_at)
+        _, engine = o2c.build_runtime(persistence, owner_id=organization_id, now=intent.due_at)
         order = persistence.entity("sales_order", fixtures.o2c.order_id)
         if order is None:
             raise RuntimeError("sales order disappeared")
@@ -773,10 +899,10 @@ def _execute_intent(
             # Each transition commits independently, so a worker may restart at
             # authorized, captured, settlement_pending or already settled. Never
             # replay an already-committed capture or rewind the logical position.
-            position = persistence.simulation_position()
+            position = persistence.simulation_position(owner_id=organization_id)
             restore_at = position.logical_time if position is not None else intent.due_at
             target_at = max(restore_at, intent.due_at)
-            _, engine = payments.build_runtime(persistence, now=restore_at)
+            _, engine = payments.build_runtime(persistence, owner_id=organization_id, now=restore_at)
             backend = SimPyBackend(origin=restore_at)
             engine.rebuild_backend(backend)
             # Reattach durable resource reservations before any release operation.
@@ -869,10 +995,10 @@ def _execute_intent(
             # Journal submission and posting are separate committed transitions.
             # Restore the backend at the authoritative position before advancing
             # to the intent due time; rebuilding at a later origin is invalid.
-            position = persistence.simulation_position()
+            position = persistence.simulation_position(owner_id=organization_id)
             restore_at = position.logical_time if position is not None else intent.due_at
             target_at = max(restore_at, intent.due_at)
-            _, engine = r2r.build_runtime(persistence, now=restore_at)
+            _, engine = r2r.build_runtime(persistence, owner_id=organization_id, now=restore_at)
             backend = SimPyBackend(origin=restore_at)
             engine.rebuild_backend(backend)
             backend.run_until(backend.now)
@@ -902,7 +1028,7 @@ def _execute_intent(
         # receipt; proof insert and staged Command deletion share one UoW.
         # A crash after business transition but before this commit retries
         # idempotently instead of silently asserting an ACK is an effect.
-        position = persistence.simulation_position()
+        position = persistence.simulation_position(owner_id=organization_id)
         completed_at = max(
             intent.due_at,
             position.logical_time if position is not None else intent.due_at,
@@ -917,8 +1043,19 @@ def _execute_intent(
                 uow.delete_command(effect_id)
 
 
+def _operational_owner(organization_owners: Mapping[str, str], correlation_id: str) -> str:
+    """Resolve an explicit durable binding; correlation never becomes ownership."""
+    if not isinstance(correlation_id, str) or not correlation_id.strip():
+        raise ValueError("egress correlation_id must not be empty")
+    owner_id = organization_owners.get(correlation_id)
+    if not isinstance(owner_id, str) or not owner_id.strip():
+        raise ValueError("egress requires explicit correlation-to-organization ownership")
+    return owner_id
+
+
 def reconcile_shipped_fulfillment_egress(
-    persistence: MemoryPersistence, *, correlation_id: str | None = None,
+    persistence: MemoryPersistence, *, organization_owners: Mapping[str, str],
+    correlation_id: str | None = None,
     max_new_messages: int | None = None,
     recovery_job_id: str | None = None,
 ) -> tuple[BoundaryMessage, ...]:
@@ -1087,7 +1224,10 @@ def reconcile_shipped_fulfillment_egress(
             source_identity=order_id,
             correlation=reservation.correlation_id,
             causation=reservation.message_id,
-            produced_at=_next_logical_time(persistence, reservation.produced_at),
+            produced_at=_next_logical_time(
+                persistence, reservation.produced_at,
+                organization_id=_operational_owner(organization_owners, reservation.correlation_id),
+            ),
             payload={
                 "fulfillment_order_id": order_id,
                 "stock_id": stock_id,
@@ -1120,7 +1260,10 @@ def reconcile_shipped_fulfillment_egress(
             source_identity=order_id,
             correlation=reservation.correlation_id,
             causation=consumption.message_id,
-            produced_at=_next_logical_time(persistence, consumption.produced_at),
+            produced_at=_next_logical_time(
+                persistence, consumption.produced_at,
+                organization_id=_operational_owner(organization_owners, consumption.correlation_id),
+            ),
             payload={"fulfillment_order_id": order_id, "shipment_id": shipment_id},
         )
         if dispatch is None:
@@ -1130,7 +1273,8 @@ def reconcile_shipped_fulfillment_egress(
 
 
 def reconcile_completed_logistics_egress(
-    persistence: MemoryPersistence, *, correlation_id: str | None = None,
+    persistence: MemoryPersistence, *, organization_owners: Mapping[str, str],
+    correlation_id: str | None = None,
     max_new_messages: int | None = None,
     recovery_job_id: str | None = None,
 ) -> tuple[BoundaryMessage, ...]:
@@ -1199,7 +1343,10 @@ def reconcile_completed_logistics_egress(
             prior = uow.get_boundary_message(identity)
         produced_at = (
             prior.produced_at if prior is not None
-            else _next_logical_time(persistence, dispatch.produced_at)
+            else _next_logical_time(
+                persistence, dispatch.produced_at,
+                organization_id=_operational_owner(organization_owners, dispatch.correlation_id),
+            )
         )
         message = BoundaryMessage.create(
             contract_name="logistics.delivery_completed", contract_version=1,
@@ -1224,7 +1371,8 @@ def reconcile_completed_logistics_egress(
 
 
 def reconcile_invoiced_o2c_egress(
-    persistence: MemoryPersistence, *, correlation_id: str | None = None,
+    persistence: MemoryPersistence, *, organization_owners: Mapping[str, str],
+    correlation_id: str | None = None,
     max_new_messages: int | None = None,
     recovery_job_id: str | None = None,
 ) -> tuple[BoundaryMessage, ...]:
@@ -1303,7 +1451,10 @@ def reconcile_invoiced_o2c_egress(
             previous = uow.get_boundary_message(identity)
         produced_at = (
             previous.produced_at if previous is not None
-            else _next_logical_time(persistence, upstream.produced_at)
+            else _next_logical_time(
+                persistence, upstream.produced_at,
+                organization_id=_operational_owner(organization_owners, upstream.correlation_id),
+            )
         )
         outgoing = BoundaryMessage.create(
             contract_name="o2c.payment_requested", contract_version=1,
@@ -1331,7 +1482,8 @@ def reconcile_invoiced_o2c_egress(
 
 
 def reconcile_settled_payment_egress(
-    persistence: MemoryPersistence, *, correlation_id: str | None = None,
+    persistence: MemoryPersistence, *, organization_owners: Mapping[str, str],
+    correlation_id: str | None = None,
     max_new_messages: int | None = None,
     recovery_job_id: str | None = None,
 ) -> tuple[BoundaryMessage, ...]:
@@ -1401,7 +1553,10 @@ def reconcile_settled_payment_egress(
             existing = uow.get_boundary_message(identity)
         produced_at = (
             existing.produced_at if existing is not None
-            else _next_logical_time(persistence, upstream.produced_at)
+            else _next_logical_time(
+                persistence, upstream.produced_at,
+                organization_id=_operational_owner(organization_owners, upstream.correlation_id),
+            )
         )
         message = BoundaryMessage.create(
             contract_name="accounting.entry_requested", contract_version=1,
@@ -1430,7 +1585,8 @@ def reconcile_settled_payment_egress(
 
 
 def run_customer_demand_path(
-    *, persistence: MemoryPersistence | None = None, instance_key: str | None = None,
+    *, organization_id: str,
+    persistence: MemoryPersistence | None = None, instance_key: str | None = None,
 ) -> CustomerDemandPathResult:
     """Execute the durable Trading Company customer-demand composition path.
 
@@ -1438,12 +1594,14 @@ def run_customer_demand_path(
     Management and never creates authoritative Warehouse Fulfillment inventory lots.
     """
 
+    if not isinstance(organization_id, str) or not organization_id.strip():
+        raise ValueError("organization_id must not be empty")
     if persistence is not None and instance_key is None:
         raise ValueError("instance_key is required for injected persistence")
     if instance_key is not None and (not isinstance(instance_key, str) or not instance_key.strip()):
         raise ValueError("instance_key must be a nonempty string")
     persistence = persistence if persistence is not None else MemoryPersistence()
-    position = persistence.simulation_position()
+    position = persistence.simulation_position(owner_id=organization_id)
     origin = max(
         o2c.ORIGIN, position.logical_time if position is not None else o2c.ORIGIN,
     )
@@ -1460,7 +1618,8 @@ def run_customer_demand_path(
             )
 
     sales_order = o2c.seed_reference(
-        persistence, now=origin, amount=amount, currency=currency,
+        persistence, owner_id=organization_id,
+        now=origin, amount=amount, currency=currency,
         instance_key=instance_key,
     )
     fulfillment_order_id = deterministic_id(
@@ -1476,6 +1635,7 @@ def run_customer_demand_path(
         ),
         warehouse=wm.seed_reference(
             persistence,
+            owner_id=organization_id,
             now=origin,
             origin_on_hand=20.0,
             transfer_quantity=1.0,
@@ -1484,11 +1644,13 @@ def run_customer_demand_path(
         ),
         logistics=logistics.seed_reference(
             persistence,
+            owner_id=organization_id,
             now=origin,
             instance_key=instance_key,
         ),
         payments=payments.seed_reference(
             persistence,
+            owner_id=organization_id,
             now=origin,
             amount=amount,
             currency=currency,
@@ -1496,6 +1658,7 @@ def run_customer_demand_path(
         ),
         r2r=r2r.seed_reference(
             persistence,
+            owner_id=organization_id,
             now=origin,
             amount=amount,
             currency=currency,
@@ -1503,7 +1666,7 @@ def run_customer_demand_path(
         ),
     )
 
-    _, o2c_engine = o2c.build_runtime(persistence, now=origin)
+    _, o2c_engine = o2c.build_runtime(persistence, owner_id=organization_id, now=origin)
     if not o2c.reconcile_credit(
         persistence,
         o2c_engine,
@@ -1538,7 +1701,7 @@ def run_customer_demand_path(
     ))
 
     service = BoundaryService(persistence)
-    registry = _registry(fixtures)
+    registry = _registry(fixtures, owner_id=organization_id)
     messages: list[BoundaryMessage] = []
     effects: list[str] = []
 
@@ -1563,6 +1726,7 @@ def run_customer_demand_path(
                     effect_id=effect,
                     fixtures=fixtures,
                     correlation_id=correlation_id,
+                    organization_id=organization_id,
                 )
                 break
             except DurableResourceWait:
@@ -1594,7 +1758,9 @@ def run_customer_demand_path(
             produced_at=(
                 origin
                 if previous is None
-                else _next_logical_time(persistence, previous.produced_at)
+                else _next_logical_time(
+                    persistence, previous.produced_at, organization_id=organization_id
+                )
             ),
             payload=payload,
             contract_version=contract_version,
@@ -1653,6 +1819,7 @@ def run_customer_demand_path(
     # are the authoritative source for outbound consumption and dispatch.
     reconstructed = reconcile_shipped_fulfillment_egress(
         persistence, correlation_id=correlation_id,
+        organization_owners={correlation_id: organization_id},
     )
     if len(reconstructed) != 1 or reconstructed[0].contract_key != (
         "warehouse.inventory_consumption_requested.v1"
@@ -1663,6 +1830,7 @@ def run_customer_demand_path(
     )
     reconstructed = reconcile_shipped_fulfillment_egress(
         persistence, correlation_id=correlation_id,
+        organization_owners={correlation_id: organization_id},
     )
     if len(reconstructed) != 2 or reconstructed[1].contract_key != (
         "warehouse.dispatch_ready.v1"

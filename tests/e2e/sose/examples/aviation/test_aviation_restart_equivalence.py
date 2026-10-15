@@ -19,10 +19,12 @@ from sose.persistence.memory import MemoryPersistence
 from sose.testing.restart import restart_reference_runtime
 
 
+
+REFERENCE_OWNER_ID = "aviation-restart-equivalence-reference"
 def test_departure_schedule_survives_restart():
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=REFERENCE_OWNER_ID)
+    _, engine = build_runtime(persistence, owner_id=REFERENCE_OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 
@@ -37,6 +39,7 @@ def test_departure_schedule_survives_restart():
         persistence,
         build_runtime,
         backend,
+        owner_id=REFERENCE_OWNER_ID,
         backend_factory=SimPyBackend,
     )
     rebuilt_engine = rebuilt.engine
@@ -51,8 +54,8 @@ def test_departure_schedule_survives_restart():
 
 def test_pending_crew_demand_survives_restart():
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=REFERENCE_OWNER_ID)
+    _, engine = build_runtime(persistence, owner_id=REFERENCE_OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     due_at = schedule_departure(
@@ -90,6 +93,7 @@ def test_pending_crew_demand_survives_restart():
         persistence,
         build_runtime,
         backend,
+        owner_id=REFERENCE_OWNER_ID,
         backend_factory=SimPyBackend,
     )
     rebuilt_engine = rebuilt.engine
@@ -125,8 +129,8 @@ def test_pending_crew_demand_survives_restart():
 
 def test_airborne_flight_reconciles_aircraft_after_dispatch_crash():
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=REFERENCE_OWNER_ID)
+    _, engine = build_runtime(persistence, owner_id=REFERENCE_OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     due_at = schedule_departure(
@@ -203,8 +207,8 @@ def test_airborne_flight_reconciles_aircraft_after_dispatch_crash():
 
 def _prepare_aog_with_part():
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=REFERENCE_OWNER_ID)
+    _, engine = build_runtime(persistence, owner_id=REFERENCE_OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     leg1_due, _ = schedule_rotation(
@@ -271,6 +275,7 @@ def test_committed_maintenance_queue_selection_survives_restart():
         persistence,
         build_runtime,
         backend,
+        owner_id=REFERENCE_OWNER_ID,
         backend_factory=SimPyBackend,
     )
     rebuilt_engine = rebuilt.engine
@@ -328,6 +333,7 @@ def test_completed_maintenance_reconciles_aircraft_and_flight_after_restart():
         persistence,
         build_runtime,
         backend,
+        owner_id=REFERENCE_OWNER_ID,
         backend_factory=SimPyBackend,
     )
     rebuilt_engine = rebuilt.engine

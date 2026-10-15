@@ -72,6 +72,18 @@ def records_to_state(records: Iterable[StateRecord]) -> _State:
         grouped.setdefault(record.collection, []).append(record)
 
     template = _State()
+    known = {field.name for field in fields(_State)}
+    legacy = {"simulation_position", "scenario_state", "committed_tick"}
+    unknown = set(grouped) - known
+    if unknown:
+        if unknown & legacy:
+            raise ValueError(
+                "unsupported legacy unowned runtime records: "
+                + ", ".join(sorted(unknown & legacy))
+            )
+        raise ValueError(
+            "unknown durable record collections: " + ", ".join(sorted(unknown))
+        )
     values: dict[str, object] = {}
 
     for field in fields(_State):
@@ -85,7 +97,11 @@ def records_to_state(records: Iterable[StateRecord]) -> _State:
         if isinstance(default_value, dict):
             restored: dict[object, object] = {}
             for record in current:
-                restored[loads(record.key)] = loads(record.payload)
+                decoded_key = loads(record.key)
+                if name in {"simulation_positions", "scenario_states", "committed_ticks"}:
+                    if not isinstance(decoded_key, str) or not decoded_key.strip():
+                        raise ValueError(f"unowned durable temporal record in {name}")
+                restored[decoded_key] = loads(record.payload)
             values[name] = restored
             continue
 

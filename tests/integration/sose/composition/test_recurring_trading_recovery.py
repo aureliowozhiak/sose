@@ -43,7 +43,7 @@ def test_recurring_recovery_trigger_resumes_durable_customer_boundary(
             raise RuntimeError("simulated process death")
         return original_publish(service, contract_name=contract_name, **kwargs)
 
-    def crashing_execute(persistence, *, effect_id, fixtures, correlation_id):
+    def crashing_execute(persistence, *, effect_id, fixtures, correlation_id, organization_id):
         intent = persistence.command(effect_id)
         if (
             crash_point == "ack_before_business_effect"
@@ -53,20 +53,29 @@ def test_recurring_recovery_trigger_resumes_durable_customer_boundary(
             raise RuntimeError("simulated process death")
         return original_execute(
             persistence, effect_id=effect_id, fixtures=fixtures,
-            correlation_id=correlation_id,
+            correlation_id=correlation_id, organization_id=organization_id,
         )
 
     monkeypatch.setattr(customer, "_publish", crashing_publish)
     monkeypatch.setattr(customer, "_execute_intent", crashing_execute)
     with pytest.raises(RuntimeError, match="simulated process death"):
-        customer.run_customer_demand_path()
+        customer.run_customer_demand_path(organization_id="test-org-recurring-trading-recovery")
     held[-1].close()
     monkeypatch.setattr(customer, "_publish", original_publish)
     monkeypatch.setattr(customer, "_execute_intent", original_execute)
 
     recovered = SQLiteIncrementalPersistence(path)
     now = o2c.ORIGIN + timedelta(days=1)
+    with recovered.transaction() as uow:
+        correlations = {
+            message.correlation_id
+            for delivery in uow.boundary_deliveries()
+            if (message := uow.get_boundary_message(delivery.message_id)) is not None
+        }
+    assert len(correlations) == 1
+    owner_bindings = {next(iter(correlations)): "test-org-recurring-trading-recovery"}
     worker = TradingCustomerRecoveryRunner(
+        organization_owners=owner_bindings,
         persistence=recovered, owner_id="new-worker",
         job_id="trading-pc6-recovery-test",
     )

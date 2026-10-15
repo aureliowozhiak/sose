@@ -76,7 +76,7 @@ with PostgresPersistence(dsn, namespace=namespace) as store:
             time.sleep(.025)
     store.boundary_transaction = faulting_transaction
     receipt = service.consume(
-        lease=lease, registry=TradingCustomerRecoveryRunner._registry_for(message),
+        lease=lease, registry=TradingCustomerRecoveryRunner._registry_for(message, organization_id="a"),
         now=__import__("sose.examples.order_to_cash.simulation", fromlist=["ORIGIN"]).ORIGIN,
     )
     # A transport break may make the caller's apparent outcome uncertain.
@@ -112,7 +112,7 @@ def _complete(dsn, domains, physical, seeds):
 def _scenario(tmp_path, *, phase, transport):
     domains = {org: f"commit_{org}_{uuid4().hex[:12]}" for org in ("a", "b")}
     physical = f"commit_phys_{uuid4().hex[:12]}"
-    seeded = {org: _seed_before_logistics_ack(DSN, ns)
+    seeded = {org: _seed_before_logistics_ack(DSN, ns, org)
               for org, ns in domains.items()}
     seeds = {org: data[:2] for org, data in seeded.items()}
     marker = tmp_path / f"{phase}-{transport}-paused"
@@ -197,7 +197,7 @@ def _uninterrupted_reference(phase):
     """Same durable starting ACK state, but no failed transport or DB service."""
     domains = {org: f"control_ack_{org}_{uuid4().hex[:12]}" for org in ("a", "b")}
     physical = f"control_ack_phys_{uuid4().hex[:12]}"
-    seeded = {org: _seed_before_logistics_ack(DSN, ns)
+    seeded = {org: _seed_before_logistics_ack(DSN, ns, org)
               for org, ns in domains.items()}
     seeds = {org: data[:2] for org, data in seeded.items()}
     assert seeds["a"] == seeds["b"]
@@ -219,7 +219,7 @@ def _uninterrupted_reference(phase):
             assert message is not None
             receipt = service.consume(
                 lease=lease,
-                registry=TradingCustomerRecoveryRunner._registry_for(message),
+                registry=TradingCustomerRecoveryRunner._registry_for(message, organization_id="a"),
                 now=o2c.ORIGIN,
             )
             assert receipt.consumer_effect_id == seeded["a"][1]

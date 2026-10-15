@@ -174,9 +174,10 @@ class O2CReferenceDomain:
             raise ValueError("O2C preflight interventions must not be combined")
 
         persistence = MemoryPersistence()
-        entities = seed_reference(persistence, amount=amount)
+        entities = seed_reference(persistence, owner_id="o2c-reference-organization", amount=amount)
         _, engine = build_runtime(
             persistence,
+            owner_id="o2c-reference-organization",
             random_seed=scoped_seed(request.root_seed, world.crn_group, request.replication),
         )
         backend = SimPyBackend(origin=ORIGIN)

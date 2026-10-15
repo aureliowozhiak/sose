@@ -121,6 +121,7 @@ def restructure_id(loan_id_value: str, ordinal: int = 1) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -144,6 +145,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -152,6 +154,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     principal: float = 1200.0,
     installment_count: int = 3,
@@ -161,7 +164,7 @@ def seed_reference(
         raise ValueError("principal must be positive")
     if installment_count <= 0:
         raise ValueError("installment_count must be positive")
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
     application = context.entities.create(
         LoanApplication,
         key=("credit-loans-reference", "application-1"),

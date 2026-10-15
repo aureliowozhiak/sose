@@ -29,7 +29,7 @@ def test_restart_recovers_o2c_and_payment_request_from_durable_delivery(
     original_execute = customer._execute_intent
     original_receivable = customer.o2c.ensure_receivable
 
-    def interrupted_execute(persistence, *, effect_id, fixtures, correlation_id):
+    def interrupted_execute(persistence, *, effect_id, fixtures, correlation_id, organization_id):
         effect = persistence.command(effect_id)
         if crash_point == "before_o2c_effect" and effect is not None and (
             effect.name == "composition.complete_external_fulfillment"
@@ -37,7 +37,7 @@ def test_restart_recovers_o2c_and_payment_request_from_durable_delivery(
             raise RuntimeError("worker killed at O2C")
         return original_execute(
             persistence, effect_id=effect_id, fixtures=fixtures,
-            correlation_id=correlation_id,
+            correlation_id=correlation_id, organization_id=organization_id,
         )
 
     def interrupted_receivable(*args, **kwargs):
@@ -51,13 +51,22 @@ def test_restart_recovers_o2c_and_payment_request_from_durable_delivery(
     monkeypatch.setattr(customer, "_execute_intent", interrupted_execute)
     monkeypatch.setattr(customer.o2c, "ensure_receivable", interrupted_receivable)
     with pytest.raises(RuntimeError, match="worker killed at O2C"):
-        customer.run_customer_demand_path()
+        customer.run_customer_demand_path(organization_id="test-org-o2c-durable-recovery")
 
     monkeypatch.setattr(customer, "_execute_intent", original_execute)
     monkeypatch.setattr(customer.o2c, "ensure_receivable", original_receivable)
     opened[-1].close()
     with SQLiteIncrementalPersistence(path) as store:
+        with store.transaction() as uow:
+            correlations = {
+                message.correlation_id
+                for delivery in uow.boundary_deliveries()
+                if (message := uow.get_boundary_message(delivery.message_id)) is not None
+            }
+        assert len(correlations) == 1
+        owner_bindings = {next(iter(correlations)): "test-org-o2c-durable-recovery"}
         runner = TradingCustomerRecoveryRunner(
+            organization_owners=owner_bindings,
             persistence=store, owner_id="o2c-restart",
             job_id="o2c-recovery-test", max_actions=16,
         )
@@ -119,23 +128,23 @@ def test_payment_egress_requires_ack_and_completed_o2c_effect(tmp_path, monkeypa
     monkeypatch.setattr(customer, "MemoryPersistence", factory)
     original_execute = customer._execute_intent
 
-    def interrupted(persistence, *, effect_id, fixtures, correlation_id):
+    def interrupted(persistence, *, effect_id, fixtures, correlation_id, organization_id):
         effect = persistence.command(effect_id)
         if effect is not None and effect.name == "composition.complete_external_fulfillment":
             raise RuntimeError("crash before O2C effect")
         return original_execute(
             persistence, effect_id=effect_id, fixtures=fixtures,
-            correlation_id=correlation_id,
+            correlation_id=correlation_id, organization_id=organization_id,
         )
 
     monkeypatch.setattr(customer, "_execute_intent", interrupted)
     with pytest.raises(RuntimeError, match="crash before O2C"):
-        customer.run_customer_demand_path()
+        customer.run_customer_demand_path(organization_id="test-org-o2c-durable-recovery")
     monkeypatch.setattr(customer, "_execute_intent", original_execute)
     opened[-1].close()
 
     with SQLiteIncrementalPersistence(db) as store:
-        assert customer.reconcile_invoiced_o2c_egress(store) == ()
+        assert _owner_scoped_reconcile_invoiced_o2c_egress(store) == ()
         with store.transaction() as uow:
             inbound = next(
                 uow.get_boundary_message(d.message_id)
@@ -143,8 +152,16 @@ def test_payment_egress_requires_ack_and_completed_o2c_effect(tmp_path, monkeypa
                 if d.contract_name == "logistics.delivery_completed"
             )
         assert inbound is not None
+        with store.transaction() as uow:
+            correlations = {
+                message.correlation_id
+                for delivery in uow.boundary_deliveries()
+                if (message := uow.get_boundary_message(delivery.message_id)) is not None
+            }
+        assert len(correlations) == 1
+        owner_bindings = {next(iter(correlations)): "test-org-o2c-durable-recovery"}
         worker = TradingCustomerRecoveryRunner(
-            store, owner_id="o2c", job_id="o2c-proof", max_actions=16,
+            store, organization_owners=owner_bindings, owner_id="o2c", job_id="o2c-proof", max_actions=16,
         )
         worker.run_trigger(
             trigger_id="apply-o2c", now=o2c.ORIGIN + timedelta(days=1),
@@ -152,13 +169,13 @@ def test_payment_egress_requires_ack_and_completed_o2c_effect(tmp_path, monkeypa
         fenced = FencedEnginePersistence(
             store, WriterLease(owner_id="o2c", epoch=store.writer_epoch()),
         )
-        assert len(customer.reconcile_invoiced_o2c_egress(fenced)) == 1
-        assert customer.reconcile_invoiced_o2c_egress(fenced, max_new_messages=0)
-        assert not customer.reconcile_invoiced_o2c_egress(
+        assert len(_owner_scoped_reconcile_invoiced_o2c_egress(fenced)) == 1
+        assert _owner_scoped_reconcile_invoiced_o2c_egress(fenced, max_new_messages=0)
+        assert not _owner_scoped_reconcile_invoiced_o2c_egress(
             fenced, correlation_id="unrelated-order",
         )
         with pytest.raises(ValueError, match="max_new_messages"):
-            customer.reconcile_invoiced_o2c_egress(fenced, max_new_messages=-1)
+            _owner_scoped_reconcile_invoiced_o2c_egress(fenced, max_new_messages=-1)
 
 
 def test_payment_egress_rejects_tampered_durable_existing_output(tmp_path, monkeypatch):
@@ -171,7 +188,7 @@ def test_payment_egress_rejects_tampered_durable_existing_output(tmp_path, monke
         return store
 
     monkeypatch.setattr(customer, "MemoryPersistence", factory)
-    customer.run_customer_demand_path()
+    customer.run_customer_demand_path(organization_id="test-org-o2c-durable-recovery")
     opened[-1].close()
 
     from sose.persistence.memory import MemoryPersistence
@@ -185,7 +202,7 @@ def test_payment_egress_rejects_tampered_durable_existing_output(tmp_path, monke
                 if d.contract_name == "o2c.payment_requested"
             )
             assert payment is not None
-        assert customer.reconcile_invoiced_o2c_egress(store) == (payment,)
+        assert _owner_scoped_reconcile_invoiced_o2c_egress(store) == (payment,)
         from sose.composition.model import BoundaryMessage
         corrupt = BoundaryMessage.create(
             contract_name=payment.contract_name, contract_version=payment.contract_version,
@@ -199,4 +216,14 @@ def test_payment_egress_rejects_tampered_durable_existing_output(tmp_path, monke
         # contract, representing corrupted warehouse recovery state.
         store._state.boundary_messages[corrupt.message_id] = corrupt
         with pytest.raises(ValueError, match="conflicts"):
-            customer.reconcile_invoiced_o2c_egress(store)
+            _owner_scoped_reconcile_invoiced_o2c_egress(store)
+
+
+def _owner_scoped_reconcile_invoiced_o2c_egress(store, **kwargs):
+    """The fixture declares exactly one operational owner, not a global default."""
+    owners = {
+        receipt.correlation_id: "test-org-o2c-durable-recovery"
+        for receipt in store.business_effects()
+    }
+    assert owners, "fixture must supply a certified owner-bound flow"
+    return customer.reconcile_invoiced_o2c_egress(store, organization_owners=owners, **kwargs)

@@ -43,6 +43,7 @@ def flow_correlation_id() -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -60,6 +61,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -73,11 +75,12 @@ def _validate_quantity(quantity: float) -> None:
 def seed_happy_path(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     quantity: float = 10.0,
 ) -> ManufacturingEntities:
     _validate_quantity(quantity)
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     correlation_id = flow_correlation_id()
 
     order = context.entities.create(
@@ -810,11 +813,12 @@ def reconcile_output(
 
 def run_happy_path(
     *,
+    owner_id: str,
     quantity: float = 10.0,
 ) -> tuple[MemoryPersistence, ManufacturingEntities]:
     persistence = MemoryPersistence()
-    entities = seed_happy_path(persistence, quantity=quantity)
-    _, engine = build_runtime(persistence)
+    entities = seed_happy_path(persistence, owner_id=owner_id, quantity=quantity)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 

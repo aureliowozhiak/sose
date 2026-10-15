@@ -44,6 +44,7 @@ def flow_correlation_id() -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -61,6 +62,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -69,6 +71,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     quantity: float = 1.0,
     now: datetime = ORIGIN,
     technician_capacity: int = 1,
@@ -79,7 +82,7 @@ def seed_reference(
     if quantity <= 0 or quantity > PART_CAPACITY:
         raise ValueError("quantity must fit spare-parts capacity")
 
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     wo = context.entities.create(
         WorkOrder,
         key=("mro-reference", "wo-1"),
@@ -127,10 +130,10 @@ def seed_reference(
     return MROEntities(wo.id, demand.id)
 
 
-def build_demo() -> tuple[Engine, MemoryPersistence, str]:
+def build_demo(*, owner_id: str) -> tuple[Engine, MemoryPersistence, str]:
     persistence = MemoryPersistence()
-    ids = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    ids = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     return engine, persistence, ids.work_order_id
 
 
@@ -1000,13 +1003,14 @@ def reconcile_cancel(
 
 def run_happy_path(
     *,
+    owner_id: str,
     quantity: float = 1.0,
 ) -> tuple[MemoryPersistence, MROEntities]:
     from sose.backends.simpy import SimPyBackend
 
     persistence = MemoryPersistence()
-    ids = seed_reference(persistence, quantity=quantity)
-    _, engine = build_runtime(persistence)
+    ids = seed_reference(persistence, owner_id=owner_id, quantity=quantity)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     seed_spare_parts(engine, backend, quantity=quantity)

@@ -1,3 +1,5 @@
+OWNER_ID = "test-tutorial_job"
+
 from datetime import timedelta
 
 import pytest
@@ -24,8 +26,8 @@ def test_tutorial_happy_path_completes_from_durable_schedule():
 
 def test_tutorial_job_survives_backend_restart():
     persistence = MemoryPersistence()
-    job = seed_job(persistence)
-    _, engine = build_runtime(persistence)
+    job = seed_job(persistence, owner_id=OWNER_ID)
+    _, engine = build_runtime(persistence, owner_id=OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     complete_at = ORIGIN + timedelta(hours=2)
@@ -40,6 +42,7 @@ def test_tutorial_job_survives_backend_restart():
         persistence,
         build_runtime,
         backend,
+        owner_id=OWNER_ID,
         backend_factory=SimPyBackend,
     )
     rebuilt.backend.run_until(complete_at)
@@ -51,7 +54,7 @@ def test_tutorial_job_survives_backend_restart():
 
 def test_start_and_schedule_completion_requires_existing_job():
     persistence = MemoryPersistence()
-    _, engine = build_runtime(persistence)
+    _, engine = build_runtime(persistence, owner_id=OWNER_ID)
 
     with pytest.raises(RuntimeError, match="tutorial job not found"):
         start_and_schedule_completion(
@@ -64,8 +67,8 @@ def test_start_and_schedule_completion_requires_existing_job():
 
 def test_start_and_schedule_completion_requires_running_state():
     persistence = MemoryPersistence()
-    job = seed_job(persistence)
-    _, engine = build_runtime(persistence)
+    job = seed_job(persistence, owner_id=OWNER_ID)
+    _, engine = build_runtime(persistence, owner_id=OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     with persistence.transaction() as uow:

@@ -400,7 +400,10 @@ class SQLiteIncrementalPersistence(MemoryPersistence):
         self,
         *,
         owner_epoch: int | None = None,
+        owner_id: str | None = None,
     ) -> Iterator[MemoryUnitOfWork]:
+        if owner_id is not None and not owner_id:
+            raise ValueError("owner_id must not be empty")
         self._connection.execute("BEGIN IMMEDIATE")
         row = self._connection.execute(
             f"SELECT owner_epoch FROM {self._meta_table} WHERE singleton = 1"
@@ -496,9 +499,9 @@ class SQLiteIncrementalPersistence(MemoryPersistence):
         self._fresh()
         return super().job_states()
 
-    def committed_tick(self) -> int:
+    def committed_tick(self, *, owner_id: str) -> int:
         self._fresh()
-        return super().committed_tick()
+        return super().committed_tick(owner_id=owner_id)
 
     def events(self):
         self._fresh()
@@ -523,13 +526,13 @@ class SQLiteIncrementalPersistence(MemoryPersistence):
             if work.due_at <= at
         )
 
-    def simulation_position(self):
+    def simulation_position(self, *, owner_id: str):
         self._fresh()
-        return super().simulation_position()
+        return super().simulation_position(owner_id=owner_id)
 
-    def scenario_state(self):
+    def scenario_state(self, *, owner_id: str):
         self._fresh()
-        return super().scenario_state()
+        return super().scenario_state(owner_id=owner_id)
 
     def resource_definitions(self):
         self._fresh()

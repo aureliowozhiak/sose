@@ -120,7 +120,7 @@ def _append_position_alignment_issues(
     state: SimulationJobState,
     issues: list[JobDoctorIssue],
 ) -> None:
-    position = persistence.simulation_position()
+    position = persistence.simulation_position(owner_id=state.job_id)
     if position is None:
         if state.next_tick > 0:
             issues.append(
@@ -154,7 +154,7 @@ def inspect_open_job_health(
     resolved_config_json: str,
 ) -> JobDoctorReport:
     state = persistence.job_state(config.job.id)
-    runtime = collect_runtime_diagnostics(persistence)
+    runtime = collect_runtime_diagnostics(persistence, owner_id=config.job.id)
     issues: list[JobDoctorIssue] = [
         JobDoctorIssue(issue.code, issue.message)
         for issue in runtime.issues

@@ -56,9 +56,11 @@ class CountingPostgresPersistence(PostgresPersistence):
         super().__init__(*args, **kwargs)
 
     @contextmanager
-    def transaction(self, *, owner_epoch: int | None = None) -> Iterator:
+    def transaction(
+        self, *, owner_epoch: int | None = None, owner_id: str | None = None,
+    ) -> Iterator:
         self.transaction_count += 1
-        with super().transaction(owner_epoch=owner_epoch) as uow:
+        with super().transaction(owner_epoch=owner_epoch, owner_id=owner_id) as uow:
             yield uow
 
 
@@ -86,7 +88,7 @@ def _control(definition, namespace: str):
     job.initialize()
     for tick in range(1, 4):
         job.run_tick(trigger_id=_trigger(definition.name, tick))
-    snapshot = operational_snapshot(persistence)
+    snapshot = operational_snapshot(persistence, owner_id=job.job_id)
     count = persistence.transaction_count
     persistence.close()
     return snapshot, count
@@ -130,7 +132,7 @@ def _recover(definition, dsn: str, namespace: str):
             tick = state.next_tick + 1
             job.run_tick(trigger_id=_trigger(definition.name, tick))
 
-    snapshot = operational_snapshot(persistence)
+    snapshot = operational_snapshot(persistence, owner_id=job.job_id)
     persistence.close()
     return snapshot
 

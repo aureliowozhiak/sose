@@ -82,6 +82,7 @@ def service_task_id(stage: str, subject_id: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -107,6 +108,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -115,6 +117,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     requested_quantity: float = 10.0,
     primary_on_hand: float = 6.0,
@@ -124,7 +127,7 @@ def seed_reference(
     packing_station_capacity: int = 1,
     shipping_dock_capacity: int = 1,
 ) -> WarehouseEntities:
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
     order = context.entities.create(
         FulfillmentOrder,
         key=("warehouse-reference", "order-1"),
@@ -187,6 +190,7 @@ def seed_reference(
 def seed_composed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     requested_quantity: float = 10.0,
     requested_sku: str = PRIMARY_SKU,
@@ -216,7 +220,7 @@ def seed_composed_reference(
         if value < 1:
             raise ValueError(f"{name} must be at least one")
 
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
     order = context.entities.create(
         FulfillmentOrder,
         key=("warehouse-reference", request_key),
@@ -1359,10 +1363,10 @@ def correct_lot_balance(
     )
 
 
-def run_happy_path() -> tuple[MemoryPersistence, WarehouseEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, WarehouseEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
 
     if not allocate_order(persistence, engine, entities=entities):
         raise RuntimeError("reference inventory could not satisfy order")

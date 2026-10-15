@@ -106,6 +106,7 @@ def payment_id(claim_id: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -130,6 +131,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -138,6 +140,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     severity: int = 50,
     amount: float = 5000.0,
@@ -150,7 +153,7 @@ def seed_reference(
     amount = amount_units / 100
     if not currency:
         raise ValueError("currency must be non-empty")
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     policy = context.entities.create(
         Policy,
         key=("insurance-reference", "policy-1"),

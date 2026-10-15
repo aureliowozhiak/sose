@@ -8,6 +8,8 @@ from sose.examples.p2p.simulation import (
     run_happy_path,
 )
 
+REFERENCE_OWNER_ID = "procure-to-pay-reference-organization"
+
 
 def _durable_snapshot(persistence, ids):
     return {
@@ -28,15 +30,16 @@ def _durable_snapshot(persistence, ids):
 
 
 def test_terminal_stocking_and_consumption_replay_is_idempotent() -> None:
-    persistence, ids = run_happy_path(quantity=5.0)
+    persistence, ids = run_happy_path(quantity=5.0, owner_id=REFERENCE_OWNER_ID)
     before = _durable_snapshot(persistence, ids)
 
-    position = persistence.simulation_position()
+    position = persistence.simulation_position(owner_id=REFERENCE_OWNER_ID)
     assert position is not None
     _, engine = build_runtime(
         persistence,
         now=position.logical_time,
         tick=position.logical_tick,
+        owner_id=REFERENCE_OWNER_ID,
     )
     backend = SimPyBackend(origin=position.logical_time)
     engine.rebuild_backend(backend)

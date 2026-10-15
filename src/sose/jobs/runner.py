@@ -23,7 +23,7 @@ BackendFactory = Callable[[datetime], object]
 def scheduled_trigger_id(job_id: str, scheduled_for: datetime) -> str:
     """Return a stable trigger identity for one external scheduler occurrence."""
 
-    if not job_id:
+    if not isinstance(job_id, str) or not job_id.strip():
         raise ValueError("job_id cannot be empty")
     if scheduled_for.tzinfo is None or scheduled_for.utcoffset() is None:
         raise ValueError("scheduled_for must be timezone-aware")
@@ -77,7 +77,7 @@ class SimulationJob(Generic[ConfigT, SeedT]):
         sink_bindings: tuple[SinkBinding, ...] = (),
         domain_warehouse: DomainWarehouse | None = None,
     ) -> None:
-        if not job_id:
+        if not isinstance(job_id, str) or not job_id.strip():
             raise ValueError("job_id cannot be empty")
         self.job_id = job_id
         if ticks_per_trigger < 1:
@@ -235,7 +235,7 @@ class SimulationJob(Generic[ConfigT, SeedT]):
         config = self.definition.config_model.model_validate_json(
             pending.config_json
         )
-        bootstrap_state = self.definition.seed(self.domain_persistence, config)
+        bootstrap_state = self.definition.seed(self.domain_persistence, config, owner_id=self.job_id)
         self.flush_domain_warehouse()
         initialized = replace(
             pending,
@@ -749,7 +749,10 @@ class SimulationJob(Generic[ConfigT, SeedT]):
             config,
             logical_time,
             logical_tick,
+            owner_id=self.job_id,
         )
+        if engine.owner_id != self.job_id:
+            raise RuntimeError("domain runtime owner does not match configured job_id")
         self._attach_domain_warehouse(engine)
         backend = self.backend_factory(logical_time)
         engine.rebuild_backend(backend)
@@ -893,7 +896,7 @@ class SimulationJob(Generic[ConfigT, SeedT]):
         claimed: SimulationJobState,
         effective_trigger_id: str,
     ):
-        position = self.persistence.simulation_position()
+        position = self.persistence.simulation_position(owner_id=self.job_id)
         running = self._recover_reconcile_state(
             claimed=claimed,
             effective_trigger_id=effective_trigger_id,
@@ -936,7 +939,7 @@ class SimulationJob(Generic[ConfigT, SeedT]):
         if callable(run_until):
             run_until(context.clock.now)
 
-        committed = self.persistence.simulation_position()
+        committed = self.persistence.simulation_position(owner_id=self.job_id)
         if committed is None:
             raise RuntimeError(
                 "tick advance completed without durable simulation position"
@@ -954,7 +957,7 @@ class SimulationJob(Generic[ConfigT, SeedT]):
         return running, context, engine, backend, run_until
 
     def _build_reconcile_runtime(self, config, *, running: SimulationJobState):
-        committed = self.persistence.simulation_position()
+        committed = self.persistence.simulation_position(owner_id=self.job_id)
         if committed is None:
             raise RuntimeError(
                 "reconcile phase requires durable simulation position"
@@ -996,7 +999,7 @@ class SimulationJob(Generic[ConfigT, SeedT]):
         running: SimulationJobState,
         effective_trigger_id: str,
     ) -> SimulationJobState:
-        committed = self.persistence.simulation_position()
+        committed = self.persistence.simulation_position(owner_id=self.job_id)
         if committed is None:
             raise RuntimeError(
                 "tick completed without a durable simulation position"

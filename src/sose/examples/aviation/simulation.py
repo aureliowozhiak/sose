@@ -87,6 +87,7 @@ def part_demand_id(flight_id: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -113,6 +114,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -121,6 +123,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tail_number: str = "N-SOSE",
     leg1_number: str = "SOSE101",
@@ -131,7 +134,7 @@ def seed_reference(
     maintenance_queue_capacity: int = 100,
     part_lot_capacity: int = 100,
 ) -> AviationEntities:
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     aircraft = context.entities.create(
         Aircraft,
         key=("aviation-reference", "aircraft-1"),

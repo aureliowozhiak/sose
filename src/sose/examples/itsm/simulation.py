@@ -44,6 +44,7 @@ def escalation_id(incident_id: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -61,6 +62,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -69,6 +71,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     severity: int = 50,
     service: str = "payments-api",
@@ -76,7 +79,7 @@ def seed_reference(
     escalation_manager_capacity: int = 1,
     incident_queue_capacity: int = 100,
 ) -> ITSMEntities:
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     incident = context.entities.create(
         Incident,
         key=("itsm-reference", "incident-1"),
@@ -444,10 +447,10 @@ def reconcile_escalation(
         engine.resources.withdraw(backend, request_id)
 
 
-def run_happy_path() -> tuple[MemoryPersistence, ITSMEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, ITSMEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 
@@ -476,10 +479,10 @@ def run_happy_path() -> tuple[MemoryPersistence, ITSMEntities]:
     return persistence, entities
 
 
-def run_escalation_path() -> tuple[MemoryPersistence, ITSMEntities]:
+def run_escalation_path(*, owner_id: str) -> tuple[MemoryPersistence, ITSMEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 

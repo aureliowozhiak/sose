@@ -2,6 +2,7 @@ import sys
 from types import SimpleNamespace
 
 from sose.persistence.clickhouse import ClickHousePersistence
+from sose.persistence.codec import dumps
 
 
 class FakeClient:
@@ -30,7 +31,7 @@ def test_clickhouse_appends_committed_canonical_snapshot(monkeypatch):
 
     persistence = ClickHousePersistence(host="clickhouse")
     with persistence.transaction() as uow:
-        uow.set_committed_tick(7)
+        uow.set_committed_tick(7, owner_id="clickhouse-reference")
 
     assert any("CREATE TABLE IF NOT EXISTS sose_record_snapshot" in sql for sql in client.commands)
     assert len(client.inserts) == 1
@@ -43,7 +44,7 @@ def test_clickhouse_appends_committed_canonical_snapshot(monkeypatch):
         "position",
         "payload",
     ]
-    assert any(row[1] == "committed_tick" and row[4] == "7" for row in rows)
+    assert any(row[1] == "committed_ticks" and row[2] == dumps("clickhouse-reference") and row[4] == "7" for row in rows)
 
     persistence.close()
     assert client.closed is True

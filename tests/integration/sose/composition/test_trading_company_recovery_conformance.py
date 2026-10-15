@@ -24,6 +24,8 @@ from sose.examples.warehouse_management import simulation as wm
 from sose.persistence.sqlite import SQLitePersistence
 
 
+REPLENISHMENT_OWNER_ID = "trading-company-replenishment-reference"
+
 def _reopen(store: SQLitePersistence, path) -> SQLitePersistence:
     store.close()
     return SQLitePersistence(path)
@@ -104,7 +106,8 @@ def _claim_after_worker_death(
 
 def _customer_fixtures(store) -> customer._CustomerFixtures:
     origin = o2c.ORIGIN
-    sales_order = o2c.seed_reference(store, now=origin, amount=250.0, currency="USD")
+    sales_order = o2c.seed_reference(store,
+        owner_id="trading-customer-reference", now=origin, amount=250.0, currency="USD")
     expected_id = deterministic_id(
         "entity", "warehouse_fulfillment_order",
         "warehouse-reference", f"order:{sales_order.order_id}",
@@ -116,20 +119,24 @@ def _customer_fixtures(store) -> customer._CustomerFixtures:
         fulfillment=fulfillment.WarehouseEntities(order_id=expected_id, lot_ids=()),
         warehouse=wm.seed_reference(
             store,
+        owner_id="trading-customer-reference",
             now=origin,
             origin_on_hand=20.0,
             transfer_quantity=1.0,
             sku=fulfillment.PRIMARY_SKU,
         ),
-        logistics=logistics.seed_reference(store, now=origin),
+        logistics=logistics.seed_reference(store,
+        owner_id="trading-customer-reference", now=origin),
         payments=payments.seed_reference(
             store,
+        owner_id="trading-customer-reference",
             now=origin,
             amount=250.0,
             currency="USD",
         ),
         r2r=r2r.seed_reference(
             store,
+        owner_id="trading-customer-reference",
             now=origin,
             amount=250.0,
             currency="USD",
@@ -160,13 +167,13 @@ def _customer_business_state(store, fixtures: customer._CustomerFixtures):
 def test_customer_path_is_continuous_equivalent_across_worker_death_and_restart(
     tmp_path,
 ) -> None:
-    continuous = customer.run_customer_demand_path()
+    continuous = customer.run_customer_demand_path(organization_id="trading-customer-reference")
     path = tmp_path / "customer-composition.sqlite3"
     store = SQLitePersistence(path)
     fixtures = _customer_fixtures(store)
     origin = o2c.ORIGIN
 
-    _, engine = o2c.build_runtime(store, now=origin)
+    _, engine = o2c.build_runtime(store, owner_id="trading-customer-reference", now=origin)
     assert o2c.reconcile_credit(store, engine, entities=fixtures.o2c)
 
     correlation_id = deterministic_id(
@@ -321,7 +328,7 @@ def test_customer_path_is_continuous_equivalent_across_worker_death_and_restart(
         store, lease, consumption = _claim_after_worker_death(
             store,
             path,
-            registry_factory=lambda: customer._registry(fixtures),
+            registry_factory=lambda: customer._registry(fixtures, owner_id="trading-customer-reference"),
             owner_id=stage["owner_id"],
             now=message.produced_at,
         )
@@ -332,18 +339,19 @@ def test_customer_path_is_continuous_equivalent_across_worker_death_and_restart(
             effect_id=consumption.consumer_effect_id,
             fixtures=fixtures,
             correlation_id=correlation_id,
+            organization_id="trading-customer-reference",
         )
         store = _reopen(store, path)
 
         replay = BoundaryService(store).consume(
             lease=lease,
-            registry=customer._registry(fixtures),
+            registry=customer._registry(fixtures, owner_id="trading-customer-reference"),
             now=message.produced_at + timedelta(minutes=1),
         )
         assert replay.consumer_effect_id == consumption.consumer_effect_id
 
         causation_id = message.message_id
-        produced_at = customer._next_logical_time(store, message.produced_at)
+        produced_at = customer._next_logical_time(store, message.produced_at, organization_id="trading-customer-reference")
 
     assert tuple(message.message_id for message in messages) == continuous.message_ids
     assert tuple(effects) == continuous.effect_ids
@@ -382,6 +390,7 @@ def _replenishment_fixtures(store, *, quantity: float) -> replenishment._Fixture
     return replenishment._Fixtures(
         warehouse=wm.seed_reference(
             store,
+            owner_id=REPLENISHMENT_OWNER_ID,
             now=origin,
             origin_on_hand=2.0,
             transfer_quantity=1.0,
@@ -389,12 +398,14 @@ def _replenishment_fixtures(store, *, quantity: float) -> replenishment._Fixture
         ),
         procurement=p2p.seed_happy_path(
             store,
+            owner_id=REPLENISHMENT_OWNER_ID,
             now=origin,
             quantity=quantity,
             schedule=False,
         ),
         accounting=r2r.seed_reference(
             store,
+            owner_id=REPLENISHMENT_OWNER_ID,
             now=origin,
             amount=500.0,
             currency="USD",
@@ -419,7 +430,7 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
     tmp_path,
 ) -> None:
     quantity = 5.0
-    continuous = replenishment.run_replenishment_path(quantity=quantity)
+    continuous = replenishment.run_replenishment_path(owner_id=REPLENISHMENT_OWNER_ID, quantity=quantity)
     path = tmp_path / "replenishment-composition.sqlite3"
     store = SQLitePersistence(path)
     fixtures = _replenishment_fixtures(store, quantity=quantity)
@@ -454,7 +465,7 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
     store, _, consumption = _claim_after_worker_death(
         store,
         path,
-        registry_factory=lambda: replenishment._registry(fixtures),
+        registry_factory=lambda: replenishment._registry(fixtures, owner_id=REPLENISHMENT_OWNER_ID),
         owner_id="p2p-worker",
         now=message.produced_at,
     )
@@ -463,6 +474,8 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
     assert intent is not None
     replenishment._execute_procurement(
         store,
+
+        owner_id=REPLENISHMENT_OWNER_ID,
         intent=intent,
         fixtures=fixtures,
         quantity=quantity,
@@ -479,7 +492,7 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
         occurrence_key="inventory-receipt-ready",
         correlation_id=correlation_id,
         causation_id=messages[-1].message_id,
-        produced_at=replenishment._next_time(store, messages[-1].produced_at),
+        produced_at=replenishment._next_time(store, messages[-1].produced_at, owner_id=REPLENISHMENT_OWNER_ID),
         payload={
             "receipt_id": fixtures.procurement.receipt_id,
             "stock_id": fixtures.warehouse.origin_stock_id,
@@ -491,7 +504,7 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
     store, receipt_lease, consumption = _claim_after_worker_death(
         store,
         path,
-        registry_factory=lambda: replenishment._registry(fixtures),
+        registry_factory=lambda: replenishment._registry(fixtures, owner_id=REPLENISHMENT_OWNER_ID),
         owner_id="warehouse-worker",
         now=message.produced_at,
     )
@@ -500,6 +513,8 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
     assert intent is not None
     replenishment._execute_warehouse_receipt(
         store,
+
+        owner_id=REPLENISHMENT_OWNER_ID,
         intent=intent,
         fixtures=fixtures,
         quantity=quantity,
@@ -509,13 +524,15 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
 
     replay = BoundaryService(store).consume(
         lease=receipt_lease,
-        registry=replenishment._registry(fixtures),
+        registry=replenishment._registry(fixtures, owner_id=REPLENISHMENT_OWNER_ID),
         now=message.produced_at + timedelta(minutes=1),
     )
     assert replay == consumption
 
     replenishment._release_p2p_staging(
         store,
+
+        owner_id=REPLENISHMENT_OWNER_ID,
         caused_by=intent,
         fixtures=fixtures,
         quantity=quantity,
@@ -532,7 +549,7 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
         occurrence_key="replenishment-accounting-entry",
         correlation_id=correlation_id,
         causation_id=messages[-1].message_id,
-        produced_at=replenishment._next_time(store, messages[-1].produced_at),
+        produced_at=replenishment._next_time(store, messages[-1].produced_at, owner_id=REPLENISHMENT_OWNER_ID),
         payload={
             "receipt_id": fixtures.procurement.receipt_id,
             "journal_id": fixtures.accounting.journal_id,
@@ -544,7 +561,7 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
     store, _, consumption = _claim_after_worker_death(
         store,
         path,
-        registry_factory=lambda: replenishment._registry(fixtures),
+        registry_factory=lambda: replenishment._registry(fixtures, owner_id=REPLENISHMENT_OWNER_ID),
         owner_id="r2r-worker",
         now=message.produced_at,
     )
@@ -553,6 +570,8 @@ def test_replenishment_path_is_continuous_equivalent_across_restart_and_fencing(
     assert intent is not None
     replenishment._execute_accounting(
         store,
+
+        owner_id=REPLENISHMENT_OWNER_ID,
         intent=intent,
         fixtures=fixtures,
         correlation_id=correlation_id,
@@ -615,7 +634,7 @@ def test_composed_consumer_fault_rolls_back_intent_before_retry(tmp_path) -> Non
     )
     assert lease is not None
 
-    real_registry = customer._registry(fixtures)
+    real_registry = customer._registry(fixtures, owner_id="trading-customer-reference")
     real_handler = real_registry.resolve(message)
     failing_registry = BoundaryConsumerRegistry()
     failed_effect_ids: list[str] = []
@@ -658,7 +677,7 @@ def test_composed_consumer_fault_rolls_back_intent_before_retry(tmp_path) -> Non
     assert reclaimed is not None and reclaimed.epoch == lease.epoch + 1
     consumption = service.consume(
         lease=reclaimed,
-        registry=customer._registry(fixtures),
+        registry=customer._registry(fixtures, owner_id="trading-customer-reference"),
         now=message.produced_at + timedelta(seconds=7),
     )
     assert store.command(consumption.consumer_effect_id) is not None

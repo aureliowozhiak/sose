@@ -18,6 +18,8 @@ from sose.examples.manufacturing.simulation import (
 from sose.persistence.memory import MemoryPersistence
 from sose.scenarios import AttributeEffect, Scenario, ScheduledTrigger
 
+REFERENCE_OWNER_ID = "manufacturing-reference-organization"
+
 
 def _scenario() -> Scenario:
     return Scenario(
@@ -29,9 +31,9 @@ def _scenario() -> Scenario:
 
 
 def _prepare(store: MemoryPersistence):
-    ids = seed_happy_path(store, quantity=5.0)
+    ids = seed_happy_path(store, quantity=5.0, owner_id=REFERENCE_OWNER_ID)
     scenario = _scenario()
-    context, engine = build_runtime(store, scenarios=(scenario,))
+    context, engine = build_runtime(store, scenarios=(scenario,), owner_id=REFERENCE_OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 
@@ -46,13 +48,14 @@ def _prepare(store: MemoryPersistence):
 
 
 def _rebuild(store, scenario):
-    position = store.simulation_position()
+    position = store.simulation_position(owner_id=REFERENCE_OWNER_ID)
     assert position is not None
     context, engine = build_runtime(
         store,
         now=position.logical_time,
         tick=position.logical_tick,
         scenarios=(scenario,),
+        owner_id=REFERENCE_OWNER_ID,
     )
     backend = SimPyBackend(origin=position.logical_time)
     engine.rebuild_backend(backend)
@@ -109,8 +112,8 @@ def _snapshot(store, ids):
         "operation": store.entity("manufacturing_operation", ids.operation_id),
         "events": store.events(),
         "scheduled_work": store.scheduled_work(),
-        "position": store.simulation_position(),
-        "scenario": store.scenario_state(),
+        "position": store.simulation_position(owner_id=REFERENCE_OWNER_ID),
+        "scenario": store.scenario_state(owner_id=REFERENCE_OWNER_ID),
         "resource_definitions": store.resource_definitions(),
         "resource_demands": store.resource_demands(),
         "resource_reservations": store.resource_reservations(),

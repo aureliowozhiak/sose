@@ -8,6 +8,9 @@ from sose.testing.restart import (
 )
 
 
+RESTART_OWNER = "restart-edge-case"
+
+
 def test_restart_reference_runtime_requires_backend_or_position():
     persistence = MemoryPersistence()
 
@@ -21,6 +24,7 @@ def test_restart_reference_runtime_requires_backend_or_position():
         restart_reference_runtime(
             persistence,
             _unused_builder,
+            owner_id=RESTART_OWNER,
             backend_factory=lambda origin: object(),
         )
 
@@ -39,6 +43,7 @@ def test_restart_reference_runtime_repeated_rejects_zero_count():
             persistence,
             _unused_builder,
             backend_before=object(),
+            owner_id=RESTART_OWNER,
             backend_factory=lambda origin: object(),
             count=0,
         )
@@ -53,7 +58,7 @@ def test_restart_reference_runtime_can_skip_boundary_drain():
         committed_sequence=0,
     )
     with persistence.transaction() as uow:
-        uow.set_simulation_position(position)
+        uow.set_simulation_position(position, owner_id=RESTART_OWNER)
 
     class _Backend:
         def __init__(self, origin):
@@ -70,13 +75,15 @@ def test_restart_reference_runtime_can_skip_boundary_drain():
         def rebuild_backend(self, backend):
             self.backend = backend
 
-    def _build_runtime(*_args, **_kwargs):
+    def _build_runtime(*_args, owner_id, **_kwargs):
+        assert owner_id == RESTART_OWNER
         return object(), _Engine()
 
     result = restart_reference_runtime(
         persistence,
         _build_runtime,
         backend_before=None,
+        owner_id=RESTART_OWNER,
         backend_factory=lambda origin: _Backend(origin),
         drain_boundary=False,
     )

@@ -28,9 +28,10 @@ def test_logistics_scenario_builders_are_well_formed():
 
 def test_finite_courier_loss_routes_through_delay_and_recovers():
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
+    entities = seed_reference(persistence, owner_id="logistics-scenarios-organization")
     context, engine = build_runtime(
-        persistence, scenarios=(courier_capacity_loss_scenario(),)
+        persistence,
+        owner_id="logistics-scenarios-organization", scenarios=(courier_capacity_loss_scenario(),)
     )
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
@@ -56,7 +57,7 @@ def test_finite_courier_loss_routes_through_delay_and_recovers():
     ) is True
     assert persistence.entity("shipment", entities.shipment_id).state == "picked_up"
 
-    state = persistence.scenario_state()
+    state = persistence.scenario_state(owner_id="logistics-scenarios-organization")
     assert state is not None
     assert sum(
         decision.scenario_name == "logistics-courier-capacity-loss"

@@ -27,11 +27,13 @@ from sose.examples.energy_utilities.simulation import (
 )
 from sose.persistence.memory import MemoryPersistence
 
+ORGANIZATION_ID = "energy-utilities-reference-organization"
+
 
 def _runtime(**seed_kwargs):
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence, **seed_kwargs)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=ORGANIZATION_ID, **seed_kwargs)
+    _, engine = build_runtime(persistence, owner_id=ORGANIZATION_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     return persistence, entities, engine, backend
@@ -397,16 +399,16 @@ def test_run_happy_path_raises_when_metering_ingestion_is_unavailable(monkeypatc
     monkeypatch.setattr(energy_simulation, "record_meter_reading", lambda *args, **kwargs: None)
 
     with pytest.raises(RuntimeError, match="meter reading ingestion unavailable"):
-        run_happy_path()
+        run_happy_path(owner_id=ORGANIZATION_ID)
 
 
 def test_run_happy_path_raises_when_demand_response_cannot_begin(monkeypatch):
     backend = SimpleNamespace(run_until=lambda due_at: None)
-    monkeypatch.setattr(energy_simulation, "seed_reference", lambda persistence: SimpleNamespace())
+    monkeypatch.setattr(energy_simulation, "seed_reference", lambda persistence, *, owner_id: SimpleNamespace())
     monkeypatch.setattr(
         energy_simulation,
         "build_runtime",
-        lambda persistence: (None, SimpleNamespace(rebuild_backend=lambda active_backend: None)),
+        lambda persistence, *, owner_id: (None, SimpleNamespace(rebuild_backend=lambda active_backend: None)),
     )
     monkeypatch.setattr(energy_simulation, "SimPyBackend", lambda origin: backend)
     monkeypatch.setattr(energy_simulation, "record_meter_reading", lambda *args, **kwargs: object())
@@ -418,7 +420,7 @@ def test_run_happy_path_raises_when_demand_response_cannot_begin(monkeypatch):
     monkeypatch.setattr(energy_simulation, "reconcile_demand_response", lambda *args, **kwargs: False)
 
     with pytest.raises(RuntimeError, match="participation failed to begin"):
-        run_happy_path()
+        run_happy_path(owner_id=ORGANIZATION_ID)
 
 
 def test_opt_out_is_idempotent_after_terminal_participation():

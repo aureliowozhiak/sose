@@ -70,6 +70,32 @@ class PostgresPersistence(MemoryPersistence):
         self._correlation_owners_table = sql.Identifier(f"{namespace}_recovery_owner")
         self._connection = psycopg.connect(dsn, autocommit=True)
 
+        # Fast path for an *already committed* namespace: a new independent
+        # organization must not wait for an unrelated owner's open transaction
+        # merely because its adapter constructor would otherwise re-run DDL.
+        # Schema bootstrap/migration still uses the exclusive namespace lock
+        # below, so concurrent first-time provisioners remain serialized.
+        relations = self._connection.execute(
+            "SELECT to_regclass(%s), to_regclass(%s), "
+            "to_regclass(%s), to_regclass(%s)",
+            (
+                f"{namespace}_record_meta",
+                f"{namespace}_record",
+                f"{namespace}_writer_scope",
+                f"{namespace}_recovery_owner",
+            ),
+        ).fetchone()
+        if relations is not None and all(relation is not None for relation in relations):
+            committed_meta = self._connection.execute(
+                sql.SQL("SELECT schema_version FROM {} WHERE singleton = 1").format(
+                    self._meta_table
+                )
+            ).fetchone()
+            if committed_meta is not None and int(committed_meta[0]) == _SCHEMA_VERSION:
+                self._revision = -1
+                self._refresh_from_db(force=True)
+                return
+
         with self._connection.transaction():
             # CREATE TABLE IF NOT EXISTS does not serialize concurrent first
             # creation of PostgreSQL composite types/catalog rows. Use the
@@ -280,6 +306,51 @@ class PostgresPersistence(MemoryPersistence):
                 # Appends live in one shared log even when source/job fences
                 # belong to independent organizations. Their index in the
                 # UoW snapshot is NOT a globally unique record key.
+                continue
+            if (
+                change.collection == "simulation_positions"
+                and change.operation == "upsert"
+            ):
+                # Each owner has its own authoritative recovery boundary. A
+                # writer must atomically replace exactly the position it read,
+                # not overwrite a newer one committed by another connection.
+                assert change.position is not None
+                assert change.payload is not None
+                owner_id = loads(change.key)
+                if not isinstance(owner_id, str) or not owner_id:
+                    raise ValueError("simulation position requires an owner key")
+                expected = before.simulation_positions.get(owner_id)
+                if expected is None:
+                    result = self._connection.execute(
+                        sql.SQL(
+                            """
+                            INSERT INTO {}(collection, record_key, position, payload)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT(collection, record_key) DO NOTHING
+                            RETURNING record_key
+                            """
+                        ).format(self._record_table),
+                        (change.collection, change.key, change.position, change.payload),
+                    )
+                else:
+                    result = self._connection.execute(
+                        sql.SQL(
+                            """
+                            UPDATE {} SET position = %s, payload = %s
+                            WHERE collection = %s AND record_key = %s
+                              AND payload = %s
+                            RETURNING record_key
+                            """
+                        ).format(self._record_table),
+                        (
+                            change.position, change.payload,
+                            change.collection, change.key, dumps(expected),
+                        ),
+                    )
+                if result.fetchone() is None:
+                    raise StaleWriterError(
+                        f"stale simulation position for owner {owner_id!r}"
+                    )
                 continue
             if change.operation == "delete":
                 self._connection.execute(
@@ -586,10 +657,20 @@ class PostgresPersistence(MemoryPersistence):
         *,
         owner_epoch: int | None = None,
         writer_scope: str | None = None,
+        owner_id: str | None = None,
     ) -> Iterator[MemoryUnitOfWork]:
+        if owner_id is not None and not owner_id:
+            raise ValueError("owner_id must not be empty")
         before: _State | None = None
         try:
             with self._connection.transaction():
+                if owner_id is not None:
+                    # Per-owner admission linearizes clock/sequence read and write.
+                    # Independent owners never contend on this advisory key.
+                    self._connection.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+                        (self.namespace, "runtime-owner:" + owner_id),
+                    )
                 if writer_scope is None:
                     # Preserve the original single-argument extension point.
                     self._lock_and_validate_epoch(owner_epoch)
@@ -734,9 +815,9 @@ class PostgresPersistence(MemoryPersistence):
         self._fresh()
         return super().job_states()
 
-    def committed_tick(self) -> int:
+    def committed_tick(self, *, owner_id: str) -> int:
         self._fresh()
-        return super().committed_tick()
+        return super().committed_tick(owner_id=owner_id)
 
     def events(self):
         self._fresh()
@@ -761,13 +842,13 @@ class PostgresPersistence(MemoryPersistence):
             if work.due_at <= at
         )
 
-    def simulation_position(self):
+    def simulation_position(self, *, owner_id: str):
         self._fresh()
-        return super().simulation_position()
+        return super().simulation_position(owner_id=owner_id)
 
-    def scenario_state(self):
+    def scenario_state(self, *, owner_id: str):
         self._fresh()
-        return super().scenario_state()
+        return super().scenario_state(owner_id=owner_id)
 
     def resource_definitions(self):
         self._fresh()

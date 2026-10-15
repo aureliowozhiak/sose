@@ -45,6 +45,7 @@ def emergency_episode_id(normal_episode_id: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -64,6 +65,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -72,6 +74,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     acuity: int = 50,
     service: str = "general-medicine",
@@ -81,7 +84,7 @@ def seed_reference(
     procedure_suite_capacity: int = 1,
     triage_queue_capacity: int = 100,
 ) -> HospitalEntities:
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     admission = context.entities.create(
         Admission,
         key=("hospital-reference", "admission-1"),

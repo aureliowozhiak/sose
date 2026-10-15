@@ -9,15 +9,18 @@ from sose.examples.credit_loans.entities import Payment
 from sose.examples.credit_loans import simulation as credit
 from sose.persistence.memory import MemoryPersistence
 
+REFERENCE_OWNER_ID = "credit-reference-organization"
+
 
 def _approved_schedule(*, principal: float = 1200.0, installment_count: int = 3):
     persistence = MemoryPersistence()
     entities = credit.seed_reference(
         persistence,
+        owner_id=REFERENCE_OWNER_ID,
         principal=principal,
         installment_count=installment_count,
     )
-    _, engine = credit.build_runtime(persistence)
+    _, engine = credit.build_runtime(persistence, owner_id=REFERENCE_OWNER_ID)
     backend = SimPyBackend(origin=credit.ORIGIN)
     engine.rebuild_backend(backend)
     assert credit.reconcile_underwriting(
@@ -42,9 +45,9 @@ def test_credit_money_and_seed_validation_edges():
     with pytest.raises(ValueError, match="USD amount must be finite"):
         credit._usd_cents(math.inf)
     with pytest.raises(ValueError, match="principal must be positive"):
-        credit.seed_reference(MemoryPersistence(), principal=0.0)
+        credit.seed_reference(MemoryPersistence(), owner_id=REFERENCE_OWNER_ID, principal=0.0)
     with pytest.raises(ValueError, match="installment_count must be positive"):
-        credit.seed_reference(MemoryPersistence(), installment_count=0)
+        credit.seed_reference(MemoryPersistence(), owner_id=REFERENCE_OWNER_ID, installment_count=0)
 
 
 def test_credit_entity_lookup_fails_loudly_for_missing_durable_state():
@@ -54,8 +57,8 @@ def test_credit_entity_lookup_fails_loudly_for_missing_durable_state():
 
 def test_underwriting_returns_pending_when_credit_analyst_is_busy():
     persistence = MemoryPersistence()
-    entities = credit.seed_reference(persistence)
-    _, engine = credit.build_runtime(persistence)
+    entities = credit.seed_reference(persistence, owner_id=REFERENCE_OWNER_ID)
+    _, engine = credit.build_runtime(persistence, owner_id=REFERENCE_OWNER_ID)
     backend = SimPyBackend(origin=credit.ORIGIN)
     engine.rebuild_backend(backend)
 
@@ -79,8 +82,8 @@ def test_underwriting_returns_pending_when_credit_analyst_is_busy():
 
 def test_loan_creation_rejects_rejected_credit_decision():
     persistence = MemoryPersistence()
-    entities = credit.seed_reference(persistence)
-    _, engine = credit.build_runtime(persistence)
+    entities = credit.seed_reference(persistence, owner_id=REFERENCE_OWNER_ID)
+    _, engine = credit.build_runtime(persistence, owner_id=REFERENCE_OWNER_ID)
     backend = SimPyBackend(origin=credit.ORIGIN)
     engine.rebuild_backend(backend)
 

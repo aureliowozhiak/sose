@@ -39,6 +39,7 @@ def _flow_id(shipment_id: str) -> str:
 def build_runtime(
     persistence: Persistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     step: timedelta = timedelta(hours=1),
@@ -55,12 +56,13 @@ def build_runtime(
     registry.register(EntityType("warehouse_management_truck", TruckChart))
     registry.register(EntityType("warehouse_management_forklift", ForkliftChart))
     registry.register(EntityType("warehouse_management_shipment", ShipmentChart))
-    return context, Engine(context=context, registry=registry, persistence=persistence)
+    return context, Engine(context=context, registry=registry, persistence=persistence, owner_id=owner_id)
 
 
 def seed_reference(
     persistence: Persistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     origin_on_hand: float = 20.0,
     transfer_quantity: float = 8.0,
@@ -86,7 +88,7 @@ def seed_reference(
     if instance_key is not None and (not isinstance(instance_key, str) or not instance_key.strip()):
         raise ValueError("instance_key must be a nonempty string")
     prefix = ("warehouse-management",) if instance_key is None else ("warehouse-management", instance_key)
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
     origin_site = context.entities.create(
         WarehouseSite,
         key=(*prefix, "site-origin"),

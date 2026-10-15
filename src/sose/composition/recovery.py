@@ -70,6 +70,7 @@ class TradingCustomerRecoveryRunner:
     lease_duration: timedelta = timedelta(hours=1)
     resource_policies: Mapping[str, ResourcePoolContract] | None = None
     resource_organizations: Mapping[str, str] | None = None
+    organization_owners: Mapping[str, str] | None = None
     resource_persistence: Persistence | None = None
     resource_slot_duration: timedelta = timedelta(minutes=5)
     resource_retry_delay: timedelta = timedelta(minutes=5)
@@ -96,6 +97,12 @@ class TradingCustomerRecoveryRunner:
             if (not hasattr(self.persistence, "dsn")
                 or self.persistence.dsn != getattr(self.resource_persistence, "dsn", None)):
                 raise ValueError("domain and physical resource ledgers must share PostgreSQL")
+        if self.organization_owners is not None and any(
+            not isinstance(correlation, str) or not correlation.strip()
+            or not isinstance(organization, str) or not organization.strip()
+            for correlation, organization in self.organization_owners.items()
+        ):
+            raise ValueError("organization_owners must contain valid durable bindings")
         if self.resource_policies is not None:
             if self.resource_slot_duration <= timedelta(0) or self.resource_retry_delay <= timedelta(0):
                 raise ValueError("resource slot and retry delay must be positive")
@@ -114,6 +121,32 @@ class TradingCustomerRecoveryRunner:
             or not callable(getattr(self.persistence, "claim_writer", None))
         ):
             raise TypeError("composition runner requires authoritative writer fencing")
+
+    def _egress_organization_owners(self) -> dict[str, str]:
+        """Bind every known correlation to its stable operational owner."""
+        correlations = set(self.organization_owners or ()) | set(self.resource_organizations or ())
+        if self.correlation_id is not None:
+            correlations = {self.correlation_id}
+        return {correlation: self._organization_for(correlation) for correlation in correlations}
+
+    def _organization_for(self, correlation_id: str) -> str:
+        """Resolve durable organizational ownership, never a worker lease identity."""
+        configured = (
+            None if self.organization_owners is None
+            else self.organization_owners.get(correlation_id)
+        )
+        physical = (
+            None if self.resource_organizations is None
+            else self.resource_organizations.get(correlation_id)
+        )
+        if configured is not None and physical is not None and configured != physical:
+            raise ValueError("physical and operational organization bindings disagree")
+        organization_id = configured if configured is not None else physical
+        if not isinstance(organization_id, str) or not organization_id.strip():
+            raise ValueError(
+                "recovery requires explicit correlation-to-organization ownership"
+            )
+        return organization_id
 
     @staticmethod
     def _pending_effects(store: Persistence) -> tuple[tuple[BoundaryMessage, str], ...]:
@@ -137,7 +170,8 @@ class TradingCustomerRecoveryRunner:
     @staticmethod
     def _execute_pending(
         store: Persistence, source: BoundaryMessage, effect_id: str,
-        *, authoritative_pickup: TemporalReservation | None = None,
+        *, organization_id: str,
+        authoritative_pickup: TemporalReservation | None = None,
         resource_persistence: Persistence | None = None,
     ) -> None:
         details = source.payload()
@@ -171,11 +205,12 @@ class TradingCustomerRecoveryRunner:
             effect_id=effect_id,
             fixtures=fixture,
             correlation_id=source.correlation_id,
+            organization_id=organization_id,
             **kwargs,
         )
 
     @staticmethod
-    def _registry_for(message: BoundaryMessage) -> BoundaryConsumerRegistry:
+    def _registry_for(message: BoundaryMessage, *, organization_id: str) -> BoundaryConsumerRegistry:
         details = message.payload()
         registry = BoundaryConsumerRegistry()
         if message.contract_key == "warehouse.inventory_consumption_requested.v1":
@@ -187,6 +222,7 @@ class TradingCustomerRecoveryRunner:
                     intent_name="composition.consume_fulfillment_inventory",
                     entity_type="warehouse_management_stock",
                     entity_id=str(details["stock_id"]),
+                    owner_id=organization_id,
                 ),
             )
         elif message.contract_key == "warehouse.dispatch_ready.v1":
@@ -198,6 +234,7 @@ class TradingCustomerRecoveryRunner:
                     intent_name="composition.deliver_shipment",
                     entity_type="shipment",
                     entity_id=str(details["shipment_id"]),
+                    owner_id=organization_id,
                 ),
             )
         elif message.contract_key == "logistics.delivery_completed.v1":
@@ -209,6 +246,7 @@ class TradingCustomerRecoveryRunner:
                     intent_name="composition.complete_external_fulfillment",
                     entity_type="sales_order",
                     entity_id=str(details["order_id"]),
+                    owner_id=organization_id,
                 ),
             )
         elif message.contract_key == "o2c.payment_requested.v1":
@@ -220,6 +258,7 @@ class TradingCustomerRecoveryRunner:
                     intent_name="composition.settle_customer_payment",
                     entity_type="card_payment",
                     entity_id=str(details["payment_id"]),
+                    owner_id=organization_id,
                 ),
             )
         elif message.contract_key == "accounting.entry_requested.v1":
@@ -237,6 +276,7 @@ class TradingCustomerRecoveryRunner:
                     intent_name=intent_name,
                     entity_type="journal_entry",
                     entity_id=str(details["journal_id"]),
+                    owner_id=organization_id,
                 ),
             )
         else:
@@ -391,6 +431,7 @@ class TradingCustomerRecoveryRunner:
             ]
             if pending:
                 source, effect_id = pending[0]
+                organization_id = self._organization_for(source.correlation_id)
                 command = store.command(effect_id)
                 if command is None:
                     raise RuntimeError("accepted effect disappeared before execution")
@@ -401,7 +442,10 @@ class TradingCustomerRecoveryRunner:
                         and command.name in self.resource_policies
                         and store.entity("shipment", command.entity_id) is not None
                     ):
-                        demand_due = customer.pickup_resource_due_at(store, command)
+                        demand_due = customer.pickup_resource_due_at(
+                            store, command,
+                            organization_id=self.resource_organizations[source.correlation_id],
+                        )
                     admitted = resource_intents.admit(
                         effect_id=effect_id,
                         intent_name=command.name,
@@ -445,15 +489,19 @@ class TradingCustomerRecoveryRunner:
                     if pickup is not None:
                         if self.resource_persistence is not None:
                             self._execute_pending(
-                                store, source, effect_id, authoritative_pickup=pickup,
+                                store, source, effect_id, organization_id=organization_id,
+                                authoritative_pickup=pickup,
                                 resource_persistence=self.resource_persistence,
                             )
                         else:
                             self._execute_pending(
-                                store, source, effect_id, authoritative_pickup=pickup,
+                                store, source, effect_id, organization_id=organization_id,
+                                authoritative_pickup=pickup,
                             )
                     else:
-                        self._execute_pending(store, source, effect_id)
+                        self._execute_pending(
+                            store, source, effect_id, organization_id=organization_id,
+                        )
                 except customer.DurableResourceWait:
                     # Physical capacity contention is waiting, not failure.
                     # The immutable Command stays durable for another slot.
@@ -469,7 +517,8 @@ class TradingCustomerRecoveryRunner:
                     delivery.message_id for delivery in uow.boundary_deliveries()
                 }
             reconstructed = customer.reconcile_shipped_fulfillment_egress(
-                store, max_new_messages=self.max_actions - actions,
+                store, organization_owners=self._egress_organization_owners(),
+                max_new_messages=self.max_actions - actions,
                 recovery_job_id=self.job_id if active_trigger is not None else None,
                 correlation_id=self.correlation_id,
             )
@@ -485,7 +534,8 @@ class TradingCustomerRecoveryRunner:
                     delivery.message_id for delivery in uow.boundary_deliveries()
                 }
             reconstructed_logistics = customer.reconcile_completed_logistics_egress(
-                store, max_new_messages=self.max_actions - actions,
+                store, organization_owners=self._egress_organization_owners(),
+                max_new_messages=self.max_actions - actions,
                 recovery_job_id=self.job_id if active_trigger is not None else None,
                 correlation_id=self.correlation_id,
             )
@@ -502,7 +552,8 @@ class TradingCustomerRecoveryRunner:
                     delivery.message_id for delivery in uow.boundary_deliveries()
                 }
             reconstructed_o2c = customer.reconcile_invoiced_o2c_egress(
-                store, max_new_messages=self.max_actions - actions,
+                store, organization_owners=self._egress_organization_owners(),
+                max_new_messages=self.max_actions - actions,
                 recovery_job_id=self.job_id if active_trigger is not None else None,
                 correlation_id=self.correlation_id,
             )
@@ -519,7 +570,8 @@ class TradingCustomerRecoveryRunner:
                     delivery.message_id for delivery in uow.boundary_deliveries()
                 }
             reconstructed_payment = customer.reconcile_settled_payment_egress(
-                store, max_new_messages=self.max_actions - actions,
+                store, organization_owners=self._egress_organization_owners(),
+                max_new_messages=self.max_actions - actions,
                 recovery_job_id=self.job_id if active_trigger is not None else None,
                 correlation_id=self.correlation_id,
             )
@@ -601,7 +653,9 @@ class TradingCustomerRecoveryRunner:
                             ),
                         ))
             service.consume(
-                lease=lease, registry=self._registry_for(message), now=now,
+                lease=lease, registry=self._registry_for(
+                    message, organization_id=self._organization_for(message.correlation_id),
+                ), now=now,
             )
             actions += 1
         return actions
@@ -625,8 +679,9 @@ class TradingCustomerRecoveryRunner:
         config = {}
         if self.scoped_writer:
             config['correlation_id'] = self.correlation_id
-            if self.resource_organizations is not None:
-                config['organization_id'] = self.resource_organizations[self.correlation_id]
+            # Persist the operational organization even without physical
+            # resource policies. A restarted job cannot silently rebind it.
+            config['organization_id'] = self._organization_for(self.correlation_id)
         config_json = json.dumps(config, sort_keys=True, separators=(',', ':'))
         # Enroll all creation paths behind one job-scoped identity fence.
         # Preflight BEFORE any scoped/global writer claim: a failed foreign

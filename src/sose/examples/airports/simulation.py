@@ -51,6 +51,7 @@ def flow_correlation_id(turnaround_id: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -71,6 +72,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -79,6 +81,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     flight_number: str = "SOSE101",
     departure_priority: int = 50,
@@ -88,7 +91,7 @@ def seed_reference(
     tug_capacity: int = 1,
     departure_queue_capacity: int = 100,
 ) -> AirportEntities:
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     turnaround = context.entities.create(
         FlightTurnaround,
         key=("airport-reference", flight_number, "turnaround"),

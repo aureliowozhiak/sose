@@ -1,3 +1,5 @@
+OWNER_ID = "test-runtime_hardening"
+
 from datetime import timedelta
 
 from sose.backends.simpy import SimPyBackend
@@ -16,8 +18,8 @@ from sose.testing.restart import restart_reference_runtime_repeated
 
 def _scheduled_batch_snapshot(count: int = 48):
     persistence = MemoryPersistence()
-    jobs = [seed_job(persistence, job_key=f"job-{index:03d}") for index in range(count)]
-    _, engine = build_runtime(persistence)
+    jobs = [seed_job(persistence, owner_id=OWNER_ID, job_key=f"job-{index:03d}") for index in range(count)]
+    _, engine = build_runtime(persistence, owner_id=OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     complete_at = ORIGIN + timedelta(hours=2)
@@ -37,14 +39,14 @@ def _scheduled_batch_snapshot(count: int = 48):
             for job in jobs
         ),
         persistence.events(),
-        persistence.simulation_position(),
+        persistence.simulation_position(owner_id=OWNER_ID),
     )
 
 
 def test_repeated_rebuilds_do_not_mutate_pending_durable_truth():
     persistence = MemoryPersistence()
-    job = seed_job(persistence)
-    _, engine = build_runtime(persistence)
+    job = seed_job(persistence, owner_id=OWNER_ID)
+    _, engine = build_runtime(persistence, owner_id=OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     complete_at = ORIGIN + timedelta(hours=2)
@@ -63,6 +65,7 @@ def test_repeated_rebuilds_do_not_mutate_pending_durable_truth():
         build_runtime,
         backend,
         backend_factory=SimPyBackend,
+        owner_id=OWNER_ID,
         count=8,
     )
 
@@ -75,8 +78,8 @@ def test_repeated_rebuilds_do_not_mutate_pending_durable_truth():
 
 def test_consumed_work_stays_stale_after_repeated_restart():
     persistence = MemoryPersistence()
-    job = seed_job(persistence)
-    _, engine = build_runtime(persistence)
+    job = seed_job(persistence, owner_id=OWNER_ID)
+    _, engine = build_runtime(persistence, owner_id=OWNER_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     complete_at = ORIGIN + timedelta(hours=1)
@@ -94,6 +97,7 @@ def test_consumed_work_stays_stale_after_repeated_restart():
         build_runtime,
         backend,
         backend_factory=SimPyBackend,
+        owner_id=OWNER_ID,
         count=3,
     )
     rebuilt.backend.run_until(complete_at)

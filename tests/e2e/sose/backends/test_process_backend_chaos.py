@@ -95,7 +95,7 @@ def _recover_to_end(definition, persistence):
             job.run_tick(
                 trigger_id=_trigger(definition.name, next_tick),
             )
-    return operational_snapshot(persistence)
+    return operational_snapshot(persistence, owner_id=job.job_id)
 
 
 def _sample_boundaries(transaction_count: int) -> tuple[int, ...]:
@@ -122,7 +122,7 @@ def test_sigkill_process_recovers_at_sampled_transaction_boundaries(tmp_path, na
     counter.close()
 
     normalized = SQLiteIncrementalPersistence(control_path)
-    expected = operational_snapshot(normalized)
+    expected = operational_snapshot(normalized, owner_id=f"{definition.name}-process-chaos")
     normalized.close()
 
     for phase in CHAOS_PHASES:
@@ -184,9 +184,11 @@ class CountingPostgresPersistence(PostgresPersistence):
         super().__init__(*args, **kwargs)
 
     @contextmanager
-    def transaction(self, *, owner_epoch: int | None = None) -> Iterator:
+    def transaction(
+        self, *, owner_epoch: int | None = None, owner_id: str | None = None,
+    ) -> Iterator:
         self.transaction_count += 1
-        with super().transaction(owner_epoch=owner_epoch) as uow:
+        with super().transaction(owner_epoch=owner_epoch, owner_id=owner_id) as uow:
             yield uow
 
 
@@ -206,7 +208,7 @@ def test_postgres_backend_termination_recovers_same_semantic_state(tmp_path, nam
     )
     _run_control(definition, control)
     transaction_count = control.transaction_count
-    expected = operational_snapshot(control)
+    expected = operational_snapshot(control, owner_id=f"{definition.name}-process-chaos")
     control.close()
 
     boundary = max(1, transaction_count // 2)

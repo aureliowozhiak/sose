@@ -102,6 +102,7 @@ def trouble_ticket_id(service_id: str, incident_key: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -125,6 +126,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -133,6 +135,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     customer_id: str = "customer-1",
     product_offering: str = "postpaid-mobile",
@@ -140,7 +143,7 @@ def seed_reference(
     sim_type: str = "eSIM",
     provisioning_capacity: int = 1,
 ) -> TelecomEntities:
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
     order = context.entities.create(
         ProductOrder,
         key=("telecom-reference", "postpaid-mobile-order-1"),
@@ -824,10 +827,10 @@ def _drop_open_incident_if_resolved(
     )
 
 
-def run_happy_path() -> tuple[MemoryPersistence, TelecomEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, TelecomEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     due_at = schedule_activation(

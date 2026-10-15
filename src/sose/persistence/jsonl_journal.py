@@ -152,7 +152,9 @@ class JSONLJournalPersistence(MemoryPersistence):
         self._transaction_count = transaction
 
     @contextmanager
-    def transaction(self) -> Iterator[MemoryUnitOfWork]:
+    def transaction(self, *, owner_id: str | None = None) -> Iterator[MemoryUnitOfWork]:
+        if owner_id is not None and not owner_id:
+            raise ValueError("owner_id must not be empty")
         self._refresh_from_journal()
         before = self._state
         try:
@@ -214,9 +216,9 @@ class JSONLJournalPersistence(MemoryPersistence):
         self._refresh_from_journal()
         return super().job_states()
 
-    def committed_tick(self) -> int:
+    def committed_tick(self, *, owner_id: str) -> int:
         self._refresh_from_journal()
-        return super().committed_tick()
+        return super().committed_tick(owner_id=owner_id)
 
     def events(self):
         self._refresh_from_journal()
@@ -241,13 +243,13 @@ class JSONLJournalPersistence(MemoryPersistence):
             if work.due_at <= at
         )
 
-    def simulation_position(self):
+    def simulation_position(self, *, owner_id: str):
         self._refresh_from_journal()
-        return super().simulation_position()
+        return super().simulation_position(owner_id=owner_id)
 
-    def scenario_state(self):
+    def scenario_state(self, *, owner_id: str):
         self._refresh_from_journal()
-        return super().scenario_state()
+        return super().scenario_state(owner_id=owner_id)
 
     def resource_definitions(self):
         self._refresh_from_journal()

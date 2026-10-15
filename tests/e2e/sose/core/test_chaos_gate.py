@@ -60,10 +60,12 @@ class _CheckpointingSQLite(SQLiteIncrementalPersistence):
         return self._checkpoints_dir / f"tx-{index}.sqlite3"
 
     @contextmanager
-    def transaction(self, *, owner_epoch: int | None = None) -> Iterator:
+    def transaction(
+        self, *, owner_epoch: int | None = None, owner_id: str | None = None,
+    ) -> Iterator:
         self.transaction_count += 1
         transaction_index = self.transaction_count
-        with super().transaction(owner_epoch=owner_epoch) as uow:
+        with super().transaction(owner_epoch=owner_epoch, owner_id=owner_id) as uow:
             yield uow
         self._checkpoint(transaction_index)
 
@@ -76,7 +78,7 @@ def _run_clean(definition, path: Path):
     job.initialize()
     for tick in range(1, TICKS + 1):
         job.run_tick(trigger_id=_trigger(definition.name, tick))
-    snapshot = operational_snapshot(persistence)
+    snapshot = operational_snapshot(persistence, owner_id=job.job_id)
     transaction_count = persistence.transaction_count
     checkpoints = {
         index: persistence.checkpoint_for(index)
@@ -108,7 +110,7 @@ def _recover_from_checkpoint(definition, path: Path):
             next_tick = state.next_tick + 1
             resumed.run_tick(trigger_id=_trigger(definition.name, next_tick))
 
-    snapshot = operational_snapshot(reopened)
+    snapshot = operational_snapshot(reopened, owner_id=resumed.job_id)
     reopened.close()
     return snapshot
 

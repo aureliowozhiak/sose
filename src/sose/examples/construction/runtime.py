@@ -58,6 +58,7 @@ def measurement_id(activity_id: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -75,6 +76,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -83,6 +85,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     quantity: float = 10.0,
     predecessor_completed: bool = True,
@@ -90,7 +93,7 @@ def seed_reference(
     if quantity <= 0 or quantity > MATERIAL_CAPACITY:
         raise ValueError("quantity must fit construction material capacity")
 
-    context, engine = build_runtime(persistence, now=now)
+    context, engine = build_runtime(persistence, owner_id=owner_id, now=now)
     predecessor = context.entities.create(
         ConstructionActivity,
         key=("construction-reference", "predecessor"),

@@ -23,11 +23,13 @@ from sose.examples.telecom.simulation import (
 )
 from sose.persistence.memory import MemoryPersistence
 
+ORGANIZATION_ID = "telecom-reference-organization"
+
 
 def _runtime():
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=ORGANIZATION_ID)
+    _, engine = build_runtime(persistence, owner_id=ORGANIZATION_ID)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     return persistence, entities, engine, backend
@@ -519,4 +521,4 @@ def test_run_happy_path_raises_when_activation_cannot_be_reconciled(monkeypatch)
     monkeypatch.setattr(telecom_simulation, "reconcile_activation", lambda *args, **kwargs: False)
 
     with pytest.raises(RuntimeError, match="telecom activation failed"):
-        telecom_simulation.run_happy_path()
+        telecom_simulation.run_happy_path(owner_id="telecom-integration-reference")

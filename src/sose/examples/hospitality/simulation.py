@@ -66,6 +66,7 @@ def no_show_id(reservation_id_value: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -86,6 +87,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -94,11 +96,12 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     room_count: int = 2,
     room_type: str = "standard",
 ) -> HospitalityEntities:
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
     rooms = tuple(
         context.entities.create(
             Room,
@@ -548,10 +551,10 @@ def record_no_show_occurrence(
     )
 
 
-def run_happy_path() -> tuple[MemoryPersistence, HospitalityEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, HospitalityEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 

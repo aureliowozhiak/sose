@@ -70,6 +70,7 @@ def occurrence_id(subscription_id: str, kind: str, ordinal: int) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -91,6 +92,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -99,12 +101,13 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     customer_id: str = "customer-1",
     initial_plan: str = "basic",
     term_duration: timedelta = TERM_DURATION,
 ) -> SubscriptionEntities:
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
     subscription = context.entities.create(
         Subscription,
         key=("saas-reference", "subscription-1"),
@@ -536,10 +539,10 @@ def withdraw_cancellation(
     return _subscription_entity(persistence, entities)
 
 
-def run_happy_path() -> tuple[MemoryPersistence, SubscriptionEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, SubscriptionEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
 

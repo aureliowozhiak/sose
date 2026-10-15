@@ -39,14 +39,14 @@ def test_payment_continuation_restarts_from_persisted_stage_and_emits_r2r(
         "dispatch": customer.payments._dispatch,
     }
 
-    def crash_before_effect(persistence, *, effect_id, fixtures, correlation_id):
+    def crash_before_effect(persistence, *, effect_id, fixtures, correlation_id, organization_id):
         current = persistence.command(effect_id)
         if cut == "ack_before_effect" and current is not None and (
             current.name == "composition.settle_customer_payment"
         ):
             raise RuntimeError("worker death in Payments")
         return originals["execute"](
-            persistence, effect_id=effect_id, fixtures=fixtures, correlation_id=correlation_id,
+            persistence, effect_id=effect_id, fixtures=fixtures, correlation_id=correlation_id, organization_id=organization_id,
         )
 
     def crash_after(target, *args, **kwargs):
@@ -74,7 +74,7 @@ def test_payment_continuation_restarts_from_persisted_stage_and_emits_r2r(
                         lambda *a, **kw: crash_after("settle", *a, **kw))
     monkeypatch.setattr(customer.payments, "_dispatch", crash_dispatch)
     with pytest.raises(RuntimeError, match="worker death in Payments"):
-        customer.run_customer_demand_path()
+        customer.run_customer_demand_path(organization_id="test-org-payments-durable-recovery")
 
     monkeypatch.setattr(customer, "_execute_intent", originals["execute"])
     monkeypatch.setattr(customer.payments, "reconcile_authorization", originals["authorize"])
@@ -88,7 +88,16 @@ def test_payment_continuation_restarts_from_persisted_stage_and_emits_r2r(
     with SQLiteIncrementalPersistence(path) as store:
         payment = next(x for x in store.entities() if x.entity_type == "card_payment")
         assert payment.state == expected_payment_state
+        with store.transaction() as uow:
+            correlations = {
+                message.correlation_id
+                for delivery in uow.boundary_deliveries()
+                if (message := uow.get_boundary_message(delivery.message_id)) is not None
+            }
+        assert len(correlations) == 1
+        owner_bindings = {next(iter(correlations)): "test-org-payments-durable-recovery"}
         runner = TradingCustomerRecoveryRunner(
+            organization_owners=owner_bindings,
             persistence=store, owner_id="payment-restart",
             job_id="payment-recovery-test", max_actions=16,
         )

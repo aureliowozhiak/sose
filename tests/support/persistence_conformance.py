@@ -88,6 +88,7 @@ class PersistenceConformanceSuite:
     def test_sink_outbox_round_trip_and_rollback_are_durable(self):
         store = self.make_persistence()
         event = DomainEvent(
+        owner_id="persistence-conformance-organization",
             event_id="event-sink-1",
             name="changed",
             entity_type="demo",
@@ -210,6 +211,7 @@ class PersistenceConformanceSuite:
     def test_transaction_exception_rolls_back_every_write(self):
         store = self.make_persistence()
         event = DomainEvent(
+        owner_id="persistence-conformance-organization",
             event_id="event-rollback",
             name="demo",
             entity_type="demo",
@@ -257,6 +259,7 @@ class PersistenceConformanceSuite:
         store = self.make_persistence()
         payload = {"nested": {"value": 1}}
         event = DomainEvent(
+        owner_id="persistence-conformance-organization",
             event_id="event-1",
             name="demo",
             entity_type="demo",
@@ -301,6 +304,7 @@ class PersistenceConformanceSuite:
             priority=100,
             sequence=2,
             command_id=later_command.command_id,
+            owner_id="test-persistence_conformance",
         )
         earlier_work = ScheduledWork(
             "work-earlier",
@@ -308,6 +312,7 @@ class PersistenceConformanceSuite:
             priority=100,
             sequence=1,
             command_id=earlier_command.command_id,
+            owner_id="test-persistence_conformance",
         )
 
         with store.transaction() as uow:
@@ -347,6 +352,7 @@ class PersistenceConformanceSuite:
             priority=100,
             sequence=3,
             command_id=rollback_command.command_id,
+            owner_id="test-persistence_conformance",
         )
         with pytest.raises(RuntimeError, match="abort schedule"):
             with store.transaction() as uow:
@@ -417,19 +423,19 @@ class PersistenceConformanceSuite:
         )
 
         with store.transaction() as uow:
-            uow.set_simulation_position(position)
-            uow.set_scenario_state(state)
+            uow.set_simulation_position(position, owner_id='test-persistence_conformance')
+            uow.set_scenario_state(state, owner_id='test-persistence_conformance')
 
         effect_payload["nested"]["value"] = 500
-        assert store.simulation_position() == position
-        persisted_state = store.scenario_state()
+        assert store.simulation_position(owner_id='test-persistence_conformance') == position
+        persisted_state = store.scenario_state(owner_id='test-persistence_conformance')
         assert persisted_state is not None
         persisted_effect = persisted_state.activations[0].effects[0]
         assert isinstance(persisted_effect, AttributeEffect)
         assert persisted_effect.value == {"nested": {"value": 1}}
 
         persisted_effect.value["nested"]["value"] = 999
-        reloaded_state = store.scenario_state()
+        reloaded_state = store.scenario_state(owner_id='test-persistence_conformance')
         assert reloaded_state is not None
         reloaded_effect = reloaded_state.activations[0].effects[0]
         assert isinstance(reloaded_effect, AttributeEffect)
@@ -444,12 +450,12 @@ class PersistenceConformanceSuite:
         changed_state = ScenarioRuntimeState()
         with pytest.raises(RuntimeError, match="abort checkpoint"):
             with store.transaction() as uow:
-                uow.set_simulation_position(changed_position)
-                uow.set_scenario_state(changed_state)
+                uow.set_simulation_position(changed_position, owner_id='test-persistence_conformance')
+                uow.set_scenario_state(changed_state, owner_id='test-persistence_conformance')
                 raise RuntimeError("abort checkpoint")
 
-        assert store.simulation_position() == position
-        assert store.scenario_state() == expected_state
+        assert store.simulation_position(owner_id='test-persistence_conformance') == position
+        assert store.scenario_state(owner_id='test-persistence_conformance') == expected_state
 
     def test_store_put_intent_lifecycle_is_atomic_and_isolated(self):
         store = self.make_persistence()

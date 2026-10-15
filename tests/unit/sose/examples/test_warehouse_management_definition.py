@@ -15,12 +15,15 @@ from sose.examples.warehouse_management.simulation import (
 )
 from sose.persistence.memory import MemoryPersistence
 
+REFERENCE_OWNER_ID = "warehouse-management-test-organization"
+
 
 def _runtime(**config_overrides):
     persistence = MemoryPersistence()
     config = WarehouseManagementConfig(**config_overrides)
     entities = seed_reference(
         persistence,
+        owner_id=REFERENCE_OWNER_ID,
         now=config.start_at,
         origin_on_hand=config.origin_on_hand,
         transfer_quantity=config.transfer_quantity,
@@ -30,6 +33,7 @@ def _runtime(**config_overrides):
     )
     _, engine = build_runtime(
         persistence,
+        owner_id=REFERENCE_OWNER_ID,
         now=config.start_at,
         step=config.tick_step,
         random_seed=config.random_seed,
@@ -81,7 +85,7 @@ def test_reconcile_finishes_partial_startup_before_advancing_to_arrival(monkeypa
     with pytest.raises(RuntimeError, match="crash-before-truck"):
         start_transfer(persistence, engine, entities=entities)
 
-    _, recovered = build_runtime(persistence, now=ORIGIN + timedelta(hours=1))
+    _, recovered = build_runtime(persistence, owner_id=REFERENCE_OWNER_ID, now=ORIGIN + timedelta(hours=1))
     _reconcile_tick(persistence, recovered, None, config, entities)
     shipment = persistence.entity("warehouse_management_shipment", entities.shipment_id)
     truck = persistence.entity("warehouse_management_truck", entities.truck_id)

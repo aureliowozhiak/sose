@@ -85,6 +85,7 @@ def service_alert_id(alert_key: str) -> str:
 def build_runtime(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     tick: int = 0,
     scenarios=(),
@@ -110,6 +111,7 @@ def build_runtime(
     return context, Engine(
         context=context,
         registry=registry,
+        owner_id=owner_id,
         persistence=persistence,
         scenarios=scenarios,
     )
@@ -118,6 +120,7 @@ def build_runtime(
 def seed_reference(
     persistence: MemoryPersistence,
     *,
+    owner_id: str,
     now: datetime = ORIGIN,
     vehicle_key: str = "vehicle-1",
     block_id: str = "block-1",
@@ -125,7 +128,7 @@ def seed_reference(
     trip_duration: timedelta = timedelta(hours=1),
     layover: timedelta = timedelta(minutes=15),
 ) -> TransitEntities:
-    context, _ = build_runtime(persistence, now=now)
+    context, _ = build_runtime(persistence, owner_id=owner_id, now=now)
     first_start = now + first_trip_delay
     first_end = first_start + trip_duration
     second_start = first_end + layover
@@ -1264,10 +1267,10 @@ def cancel_service_alert(
     return True
 
 
-def run_happy_path() -> tuple[MemoryPersistence, TransitEntities]:
+def run_happy_path(*, owner_id: str) -> tuple[MemoryPersistence, TransitEntities]:
     persistence = MemoryPersistence()
-    entities = seed_reference(persistence)
-    _, engine = build_runtime(persistence)
+    entities = seed_reference(persistence, owner_id=owner_id)
+    _, engine = build_runtime(persistence, owner_id=owner_id)
     backend = SimPyBackend(origin=ORIGIN)
     engine.rebuild_backend(backend)
     schedule_reference_block(persistence, engine, entities=entities)
