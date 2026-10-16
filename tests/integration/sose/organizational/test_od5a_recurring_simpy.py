@@ -11,6 +11,7 @@ from multiprocessing import get_context
 
 import pytest
 
+from sose.backends.simpy import SimPyBackend
 from sose.organizational.model_spec import EvidenceClass, ModelSpec
 from sose.organizational.od5a_admission import OD5aChargedCost, compile_od5a_arms
 from sose.organizational.od5a_durable import (
@@ -26,6 +27,7 @@ from sose.organizational.od5a_recurring import (
 from sose.persistence.sqlite import SQLitePersistence
 from sose.persistence.memory import MemoryUnitOfWork
 from sose.core.identity import deterministic_id
+from sose.core.runtime import ResourceDefinition, ResourceReservation
 from sose.domain.entity import Entity
 
 
@@ -115,6 +117,169 @@ def _drain(path, *, job_id="org:A", owner="worker:A", start_tick=0):
         assert current.next_tick == source["step"]
         assert source["done"]
         return tuple(actions)
+
+
+def test_od5a_native_grant_callback_barrier_prevents_unwitnessed_durable_commit(
+    tmp_path, monkeypatch,
+):
+    """RED #477: a native request without on_acquired cannot certify a grant.
+
+    Simulate a delayed native acquisition callback without fabricating a
+    persistent reservation. The worker may report a pending action or fail
+    closed, but it must never commit physical truth while its actual native
+    witness is missing. This falsifies post-commit dummy acquisitions.
+    """
+    path = tmp_path / "native-blocked.db"
+    _init(path)
+    original_request = SimPyBackend.request_resource
+    suppressed: list[tuple[str, str]] = []
+
+    def block_native_callback(
+        self, name, *, request_id, on_acquired, priority=100,
+    ):
+        suppressed.append((name, request_id))
+        return original_request(
+            self, name, request_id=request_id,
+            on_acquired=lambda _lease: None, priority=priority,
+        )
+
+    monkeypatch.setattr(SimPyBackend, "request_resource", block_native_callback)
+    with SQLitePersistence(path) as store:
+        try:
+            run_od5a_recurring_tick(
+                store, job_id="org:A", owner_id="worker:A",
+                now=CLOCK, lease_duration=LEASE, trigger_id=_trigger(store),
+                _wall_clock=lambda: CLOCK,
+            )
+        except RuntimeError:
+            # Fail-closed is allowed until the adapter persists durable waiting.
+            pass
+
+        assert suppressed, "the real recurring adapter never requested native capacity"
+        assert not store.resource_reservations(), (
+            "native acquisition callback was withheld but SOSE granted capacity"
+        )
+        source = od5a_durable_state(store, job_id="org:A")
+        assert source["step"] == 0
+        assert not od5a_durable_events(store, job_id="org:A")
+
+
+def test_native_resource_definitions_are_visible_in_same_authoritative_uow(tmp_path):
+    """#477 regression: native reconstruction cannot read stale store metadata."""
+    path = tmp_path / "definition-snapshot.db"
+    with SQLitePersistence(path) as store:
+        with store.transaction() as uow:
+            assert uow.resource_definitions() == ()
+            uow.save_resource_definition(ResourceDefinition("owner:A/slot:0", 1))
+            assert uow.resource_definitions() == (
+                ResourceDefinition("owner:A/slot:0", 1),
+            )
+        with store.transaction() as reloaded:
+            assert reloaded.resource_definitions() == (
+                ResourceDefinition("owner:A/slot:0", 1),
+            )
+
+
+@pytest.mark.parametrize("arm", ["baseline", "capacity_only"])
+def test_od5a_recurring_physical_grant_requires_actual_native_simpy_acquisition(
+    tmp_path, monkeypatch, arm,
+):
+    """RED #477: a scheduled callback is not native physical arbitration.
+
+    The first exogenous arrival in the real persistent source produces a
+    committed execution-slot reservation. The ephemeral backend must itself
+    acquire a native SimPy resource *before* that authoritative grant is
+    certified. A callback that merely calls the durable reducer cannot pass.
+    This is a minimal falsifier, NOT five-arm recovered trace conformance.
+    """
+    path = tmp_path / f"native-grant-{arm}.db"
+    _init(path, arm=arm)
+    original_request = SimPyBackend.request_resource
+    original_save = MemoryUnitOfWork.save_resource_reservation
+    original_commit = SQLitePersistence._write_state
+    requests: list[str] = []
+    acquired: list[tuple[str, str]] = []
+    witnessed_grants: dict[tuple[str, str], SimPyBackend] = {}
+    saved_grants: list[tuple[str, str]] = []
+
+    def observed_save(self, reservation):
+        # Check exact *resource name and request ID*, not a slot suffix.
+        # The authoritative grant must occur after its own native callback,
+        # not after an unrelated grant or a post-commit SimPy request.
+        identity = (reservation.resource_name, reservation.request_id)
+        if reservation.resource_name.startswith("org:A/"):
+            native_backend = witnessed_grants.get(identity)
+            assert native_backend is not None, (
+                "SOSE persisted a reservation without a prior matching native "
+                f"SimPy grant for {identity!r}"
+            )
+            assert native_backend.resource_snapshot(reservation.resource_name).in_use >= 1, (
+                "SOSE committed a physical reservation after its native lease "
+                f"was already released: {identity!r}"
+            )
+            saved_grants.append(identity)
+        return original_save(self, reservation)
+
+    def observed_request(
+        self, name, *, request_id, on_acquired, priority=100,
+    ):
+        requests.append(name)
+
+        def observed_acquisition(lease):
+            assert lease.request_id == request_id
+            assert lease.resource_name == name
+            assert self.resource_snapshot(name).in_use >= 1, (
+                "native callback did not observe occupied SimPy capacity"
+            )
+            witnessed_grants[(lease.resource_name, lease.request_id)] = self
+            acquired.append((lease.resource_name, lease.request_id))
+            on_acquired(lease)
+
+        return original_request(
+            self, name, request_id=request_id,
+            on_acquired=observed_acquisition, priority=priority,
+        )
+
+    def observed_commit(self):
+        # Saving a ResourceReservation alone is not the transaction's durable
+        # commit. Re-check native occupancy at SQLite's actual persistence
+        # boundary, catching a release after save but before transaction exit.
+        for resource_name, request_id in saved_grants:
+            native_backend = witnessed_grants[(resource_name, request_id)]
+            assert native_backend.resource_snapshot(resource_name).in_use >= 1, (
+                "native lease was released before SOSE's durable transaction "
+                f"committed: {(resource_name, request_id)!r}"
+            )
+        return original_commit(self)
+
+    monkeypatch.setattr(SimPyBackend, "request_resource", observed_request)
+    monkeypatch.setattr(MemoryUnitOfWork, "save_resource_reservation", observed_save)
+    monkeypatch.setattr(SQLitePersistence, "_write_state", observed_commit)
+    with SQLitePersistence(path) as store:
+        outcome = run_od5a_recurring_tick(
+            store, job_id="org:A", owner_id="worker:A",
+            now=CLOCK, lease_duration=LEASE, trigger_id=_trigger(store),
+            _wall_clock=lambda: CLOCK,
+        )
+        assert outcome.action == "advanced"
+        reserved = {
+            lease.resource_name for lease in store.resource_reservations()
+        }
+        assert any(name.endswith("/execution:0") for name in reserved), (
+            "control fixture must reach a real durable physical reservation"
+        )
+
+    # A backend schedule_at callback alone is not a resource request.
+    # Require the actual native acquisition callback and its correspondence
+    # to the authoritative identity; never fabricate a native grant from
+    # the reducer's persisted reservation after commit.
+    assert requests, "SimPy must natively arbitrate an execution slot"
+    assert acquired, "SimPy must acquire before SOSE certifies the grant"
+    assert saved_grants, "expected a durable reservation requiring native acquisition"
+    assert set(saved_grants).issubset(witnessed_grants)
+    assert all(resource_name in reserved for resource_name, _ in saved_grants), (
+        "native physical leases must exactly match SOSE resource identities"
+    )
 
 
 @pytest.mark.parametrize("arm", [
@@ -1217,6 +1382,125 @@ def test_registration_failure_rolls_back_source_in_same_authoritative_uow(tmp_pa
             store, job_id="org:A", arm=_arms()["baseline"], items=_items(),
         )
         assert store.job_state("org:A") is not None
+
+
+@pytest.mark.parametrize("interception", [2, 3])
+def test_native_resource_events_execute_without_sqlite_write_transaction(
+    tmp_path, monkeypatch, interception,
+):
+    """#477 P1: reconstruction/grant run_until must not hold BEGIN IMMEDIATE.
+
+    Another connection can open and commit a SQLite transaction while native
+    request callbacks are processed, not only at the first preflight advance.
+    """
+    path = tmp_path / f"native-outside-uow-{interception}.db"
+    _init(path)
+    original_run_until = SimPyBackend.run_until
+    calls = []
+
+    def inspect_writer_availability(self, at):
+        calls.append(at)
+        if len(calls) == interception:
+            with SQLitePersistence(path) as independent:
+                with independent.transaction() as uow:
+                    assert uow.get_entity("od5a_durable_pilot", "org:A") is not None
+        return original_run_until(self, at)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SimPyBackend, "run_until", inspect_writer_availability)
+        with SQLitePersistence(path) as store:
+            outcome = run_od5a_recurring_tick(
+                store, job_id="org:A", owner_id="worker",
+                now=CLOCK, lease_duration=LEASE,
+                trigger_id=_trigger(store), _wall_clock=lambda: CLOCK,
+            )
+            assert outcome.action == "advanced"
+            assert store.resource_reservations()
+    assert len(calls) >= interception
+
+
+@pytest.mark.parametrize("interception", [2, 3])
+def test_native_callback_source_swap_is_rejected_before_commit(
+    tmp_path, monkeypatch, interception,
+):
+    """#477 P1: preflight authorization is invalid after any native callback."""
+    path = tmp_path / f"native-swap-{interception}.db"
+    _init(path)
+    original_run_until = SimPyBackend.run_until
+    invocations = []
+
+    def foreign_source_swap(self, at):
+        invocations.append(at)
+        if len(invocations) == interception:
+            with SQLitePersistence(path) as writer:
+                with writer.transaction() as uow:
+                    source = uow.get_entity("od5a_durable_pilot", "org:A")
+                    upcoming = min(
+                        source.attributes["actions"],
+                        key=lambda action: (action["at"], action["seq"]),
+                    )
+                    upcoming["item"] = "item:B"
+                    uow.save_entity(source)
+        return original_run_until(self, at)
+
+    with SQLitePersistence(path) as store:
+        with monkeypatch.context() as patch:
+            patch.setattr(SimPyBackend, "run_until", foreign_source_swap)
+            with pytest.raises(StaleOD5aRunnerClaimError, match="source changed|scheduled step changed"):
+                run_od5a_recurring_tick(
+                    store, job_id="org:A", owner_id="worker",
+                    now=CLOCK, lease_duration=LEASE,
+                    trigger_id=_trigger(store), _wall_clock=lambda: CLOCK,
+                )
+        assert len(invocations) >= interception
+        assert od5a_durable_events(store, job_id="org:A") == ()
+        assert store.job_state("org:A").next_tick == 0
+
+
+@pytest.mark.parametrize("interception", [2, 3])
+def test_unrelated_owner_physical_commit_does_not_stale_native_source(
+    tmp_path, monkeypatch, interception,
+):
+    """#477: unrelated org changes cannot create a namespace-wide native lock."""
+    path = tmp_path / f"native-other-owner-{interception}.db"
+    _init(path)
+    original_run_until = SimPyBackend.run_until
+    calls = []
+
+    def commit_independent_physical_work(self, at):
+        calls.append(at)
+        if len(calls) == interception:
+            with SQLitePersistence(path) as unrelated:
+                with unrelated.transaction() as uow:
+                    uow.save_resource_definition(
+                        ResourceDefinition("org:unrelated/execution:0", 1)
+                    )
+                    uow.save_resource_reservation(ResourceReservation(
+                        reservation_id="unrelated-native-lease",
+                        request_id="unrelated-native-request",
+                        resource_name="org:unrelated/execution:0",
+                        acquired_at=datetime(2000, 1, 1, tzinfo=timezone.utc),
+                        sequence=0,
+                    ))
+        return original_run_until(self, at)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SimPyBackend, "run_until", commit_independent_physical_work)
+        with SQLitePersistence(path) as store:
+            outcome = run_od5a_recurring_tick(
+                store, job_id="org:A", owner_id="worker",
+                now=CLOCK, lease_duration=LEASE,
+                trigger_id=_trigger(store), _wall_clock=lambda: CLOCK,
+            )
+            assert outcome.action == "advanced"
+            owned = tuple(r for r in store.resource_reservations()
+                          if r.resource_name.startswith("org:A/"))
+            assert owned, "source physical grant was lost"
+            assert any(
+                r.reservation_id == "unrelated-native-lease"
+                for r in store.resource_reservations()
+            )
+    assert len(calls) >= interception
 
 
 def test_full_scheduled_action_identity_is_rechecked_inside_simpy_callback(

@@ -1,10 +1,12 @@
 """Per-organization recurring OD-5a source step driven by ephemeral native SimPy.
 
-First bounded #485 bridge only: SimPy dispatches a committed source-step
-callback, while the authoritative OD-5a reducer still arbitrates physical
-reservations and causal transitions. This does NOT yet make native SimPy
-resource scheduling the authoritative production operational mechanism,
-nor does it drain the read-side boundary reconciler (#484).
+First bounded #477 native-grant slice: the authoritative reducer still
+selects a deterministic free physical instance and owns causal transitions,
+but a recurring source tick may NOT certify a new ResourceReservation unless
+the ephemeral SimPy PriorityResource grants the exact same request/instance.
+Preexisting occupancy is reconstructed from the durable ledger each tick.
+This is NOT yet independent native pool scheduling, durable wait/fairness,
+preemption, network/uncertain-COMMIT qualification or full OD-5a admission.
 
 A scoped durable lease and SimulationJobState checkpoint fence a worker. The
 physical event, resource ledger and job checkpoint commit in ONE transaction.
@@ -13,6 +15,7 @@ No SimPy Environment, Process, Event or callback is persisted.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from json import dumps
@@ -20,6 +23,7 @@ from typing import Callable, Literal
 
 from sose.backends.simpy import SimPyBackend
 from sose.core.identity import deterministic_id
+from sose.core.runtime import ResourceDefinition, ResourceReservation
 from sose.domain.entity import Entity
 from sose.jobs.model import SimulationJobState
 from sose.jobs.registration import job_registration_guard
@@ -27,7 +31,7 @@ from sose.persistence.base import Persistence, UnitOfWork
 
 from .od5a_admission import OD5aCompiledArm
 from .od5a_durable import (
-    _KIND, _ORIGIN, _time, _advance_od5a_in_uow,
+    _KIND, _ORIGIN, _time, _advance_od5a_in_uow, _transition,
     initialize_od5a_durable,
 )
 from .od5a_mechanisms import OD5aWorkItem
@@ -455,6 +459,175 @@ def claim_od5a_recurring_tick(
         return OD5aRunnerClaim(job_id, trigger_id, owner_id, epoch, expires_at)
 
 
+class _PhysicalStepPreview:
+    """Speculative reducer ledger: no authoritative mutations or SimPy stepping.
+
+    The same reducer used by the committed runner predicts precisely which
+    physical leases must be released and requested in the next action. This
+    disposable view never writes source events or changes persisted state.
+    """
+
+    def __init__(self, reservations: tuple[ResourceReservation, ...]) -> None:
+        self.reservations: dict[str, ResourceReservation] = {
+            entry.reservation_id: entry for entry in reservations
+        }
+        self.releases: list[ResourceReservation] = []
+        self.grants: list[ResourceReservation] = []
+
+    def get_resource_reservation(self, reservation_id: str) -> ResourceReservation | None:
+        return self.reservations.get(reservation_id)
+
+    def resource_reservations(self) -> tuple[ResourceReservation, ...]:
+        return tuple(self.reservations.values())
+
+    def save_resource_reservation(self, reservation: ResourceReservation) -> None:
+        if reservation.reservation_id in self.reservations:
+            raise RuntimeError("speculative OD-5a duplicate physical reservation")
+        self.reservations[reservation.reservation_id] = reservation
+        self.grants.append(reservation)
+
+    def delete_resource_reservation(self, reservation_id: str) -> None:
+        try:
+            released = self.reservations.pop(reservation_id)
+        except KeyError as exc:
+            raise RuntimeError("speculative OD-5a release has no durable lease") from exc
+        self.releases.append(released)
+
+    def append_event(self, event: object) -> None:
+        # Event identity and causal links are verified by the real UoW, not
+        # certified by this nonauthoritative physical scheduling preview.
+        pass
+
+
+class _RecurringNativePhysicalArbiter:
+    """Native SimPy grant witness, reconstructed from a durable read snapshot.
+
+    All SimPy event advancement occurs OUTSIDE persistence transactions.
+    Inside the fenced UoW acquire/release only verify the already prepared
+    physical identities; no foreign callback can execute under DB locks.
+    """
+
+    def __init__(
+        self, backend: SimPyBackend, *,
+        definitions: tuple[ResourceDefinition, ...],
+        reservations: tuple[ResourceReservation, ...],
+        resources: dict[str, str | None],
+        job_id: str, due: float,
+    ) -> None:
+        self.backend = backend
+        self.held: dict[str, tuple[str, str]] = {}
+        self.expected: dict[str, str] = {}
+        self.prepared_releases: dict[str, str] = {}
+        if self.backend.now != _time(due):
+            raise RuntimeError("OD-5a native recovery clock is not at source due boundary")
+        definitions_by_name = {item.name: item for item in definitions}
+        ledger_by_id = {item.reservation_id: item for item in reservations}
+        for slot, reservation_id in resources.items():
+            resource_name = f"{job_id}/{slot}"
+            definition = definitions_by_name.get(resource_name)
+            if definition is None or definition.capacity != 1:
+                raise ValueError(
+                    f"OD-5a native instance lacks authoritative unit capacity: {resource_name}"
+                )
+            self.backend.create_resource(resource_name, capacity=1)
+            occupied = [r for r in reservations if r.resource_name == resource_name]
+            if reservation_id is None:
+                if occupied:
+                    raise RuntimeError(f"untracked foreign physical occupancy: {resource_name}")
+                continue
+            saved = ledger_by_id.get(reservation_id)
+            if saved is None or saved.resource_name != resource_name or len(occupied) != 1:
+                raise RuntimeError(f"OD-5a physical lease contradicts ledger: {resource_name}")
+            self.expected[resource_name] = reservation_id
+            self._request(
+                resource_name=resource_name, request_id=saved.request_id,
+                reservation_id=reservation_id,
+            )
+
+    def _request(self, *, resource_name: str, request_id: str, reservation_id: str) -> None:
+        def acquired(lease: object) -> None:
+            if (
+                getattr(lease, "resource_name") != resource_name
+                or getattr(lease, "request_id") != request_id
+                or self.backend.resource_snapshot(resource_name).in_use != 1
+            ):
+                raise RuntimeError("native SimPy lease identity or occupancy mismatch")
+            if resource_name in self.held:
+                raise RuntimeError("native SimPy allocated occupied physical instance")
+            self.held[resource_name] = (
+                reservation_id, getattr(lease, "lease_id"),
+            )
+
+        self.backend.request_resource(
+            resource_name, request_id=request_id, on_acquired=acquired,
+        )
+
+    def prepare(
+        self, *, releases: tuple[ResourceReservation, ...],
+        grants: tuple[ResourceReservation, ...], at: float,
+    ) -> None:
+        """Process reconstructed holdings, release and next requests outside DB."""
+        self.backend.run_until(_time(at))
+        for resource_name, reservation_id in self.expected.items():
+            current = self.held.get(resource_name)
+            if current is None or current[0] != reservation_id:
+                raise RuntimeError(f"native lease reconstruction failed: {resource_name}")
+
+        for released in releases:
+            resource_name = released.resource_name
+            current = self.held.get(resource_name)
+            if current is None or current[0] != released.reservation_id:
+                raise RuntimeError(f"native physical release was not reconstructed: {resource_name}")
+            self.backend.release_resource(current[1])
+            del self.held[resource_name]
+            self.prepared_releases[resource_name] = released.reservation_id
+
+        for reservation in grants:
+            if reservation.resource_name in self.held:
+                raise RuntimeError(
+                    f"native resource not released before new grant: {reservation.resource_name}"
+                )
+            self._request(
+                resource_name=reservation.resource_name,
+                request_id=reservation.request_id,
+                reservation_id=reservation.reservation_id,
+            )
+
+        self.backend.run_until(_time(at))
+        for reservation in grants:
+            current = self.held.get(reservation.resource_name)
+            if current is None or current[0] != reservation.reservation_id:
+                raise RuntimeError(
+                    f"native grant unavailable, durable wait not admitted: {reservation.resource_name}"
+                )
+            if self.backend.resource_snapshot(reservation.resource_name).in_use != 1:
+                raise RuntimeError("native lease no longer occupies physical capacity")
+
+    def acquire(self, *, resource_name: str, request_id: str, at: float) -> bool:
+        # Fenced authoritative commit never advances SimPy or runs callbacks.
+        if self.backend.now != _time(at):
+            raise RuntimeError("native physical grant clock differs from source action")
+        reservation_id = deterministic_id("od5a-durable-reservation", request_id)
+        current = self.held.get(resource_name)
+        return (
+            current is not None
+            and current[0] == reservation_id
+            and self.backend.resource_snapshot(resource_name).in_use == 1
+        )
+
+    def release(self, *, resource_name: str, reservation_id: str) -> None:
+        # The real reducer's release must exactly match a preflight release.
+        # Actual native release has already run outside the SQLite/PG UoW.
+        prepared = self.prepared_releases.pop(resource_name, None)
+        if prepared != reservation_id:
+            raise RuntimeError("authoritative release has no matching native completion")
+
+    def verify_committed_step(self) -> None:
+        if self.prepared_releases:
+            raise RuntimeError("planned native releases were not consumed by source step")
+
+
+
 def execute_od5a_claimed_tick(
     store: Persistence, *, claim: OD5aRunnerClaim, now: datetime,
     _wall_clock: Callable[[], datetime] | None = None,
@@ -484,6 +657,51 @@ def execute_od5a_claimed_tick(
         )
     dispatched: list[OD5aRecurringStep] = []
     backend = SimPyBackend(origin=_ORIGIN)
+    # A preflight hook or another worker may commit while SimPy advances
+    # to the due boundary. Never hold a database write transaction during
+    # this disposable, externally interceptable scheduling step.
+    backend.run_until(_time(due))
+    # Plan the reducer's upcoming leases using only a disposable ledger.
+    # No SimPy callbacks execute while reading the transactional snapshot.
+    with _job_transaction(store, claim.organization_id) as uow:
+        source, _, _ = _assert_claim(
+            uow, claim, _trusted_now(store, _wall_clock),
+        )
+        actions = source.attributes["actions"]
+        actual = min(actions, key=lambda x: (x["at"], x["seq"])) if actions else None
+        if actual != next_action:
+            raise StaleOD5aRunnerClaimError(
+                "OD-5a scheduled step changed before SimPy dispatch"
+            )
+        preflight_state = deepcopy(source.attributes)
+        # Compare only this organization's physical addresses. An independent
+        # owner can legitimately commit disjoint reservations between preflight
+        # and this worker's fenced commit; no namespace-wide serialization.
+        owned_names = {
+            f"{claim.organization_id}/{slot}"
+            for slot in preflight_state["resources"]
+        }
+        preflight_reservations = tuple(
+            item for item in uow.resource_reservations()
+            if item.resource_name in owned_names
+        )
+        preview = _PhysicalStepPreview(preflight_reservations)
+        _transition(
+            preview, deepcopy(preflight_state),
+            claim.organization_id,
+        )
+        native = _RecurringNativePhysicalArbiter(
+            backend, definitions=uow.resource_definitions(),
+            reservations=preflight_reservations,
+            resources=preflight_state["resources"],
+            job_id=claim.organization_id, due=due,
+        )
+
+    # Native acquisitions and their potentially adversarial callbacks are
+    # processed with NO SQLite BEGIN IMMEDIATE or PostgreSQL owner guard held.
+    native.prepare(
+        releases=tuple(preview.releases), grants=tuple(preview.grants), at=due,
+    )
 
     def commit_source_step() -> None:
         with _job_transaction(store, claim.organization_id) as uow:
@@ -493,9 +711,22 @@ def execute_od5a_claimed_tick(
             source, job, lease = _assert_claim(uow, claim, commit_at)
             actions = source.attributes["actions"]
             actual = min(actions, key=lambda x: (x["at"], x["seq"])) if actions else None
-            if actual != next_action:
-                raise StaleOD5aRunnerClaimError("OD-5a scheduled step changed before SimPy dispatch")
-            advanced = _advance_od5a_in_uow(uow, job_id=claim.organization_id)
+            if actual != next_action or source.attributes != preflight_state:
+                raise StaleOD5aRunnerClaimError(
+                    "OD-5a source changed across native physical acquisition"
+                )
+            current_owned = tuple(
+                item for item in uow.resource_reservations()
+                if item.resource_name in owned_names
+            )
+            if current_owned != preflight_reservations:
+                raise StaleOD5aRunnerClaimError(
+                    "OD-5a own physical ledger changed before native commit"
+                )
+            advanced = _advance_od5a_in_uow(
+                uow, job_id=claim.organization_id, native=native,
+            )
+            native.verify_committed_step()
             committed = uow.get_entity(_KIND, claim.organization_id)
             assert committed is not None
             job = replace(
