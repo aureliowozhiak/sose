@@ -30,8 +30,10 @@ BoundaryHandler = Callable[[BoundaryMessage, "UnitOfWork"], str]
 
 
 class BoundaryConsumerRegistry:
+    """Dispatch by exact producer/destination/contract/version identity."""
+
     def __init__(self) -> None:
-        self._handlers: dict[tuple[str, str, int], BoundaryHandler] = {}
+        self._handlers: dict[tuple[str | None, str, str, int], BoundaryHandler] = {}
 
     def register(
         self,
@@ -40,32 +42,61 @@ class BoundaryConsumerRegistry:
         contract_name: str,
         contract_version: int,
         handler: BoundaryHandler,
+        source_domain: str | None = None,
     ) -> None:
-        key = (destination_domain, contract_name, contract_version)
-        if not destination_domain or not contract_name or contract_version <= 0:
+        if source_domain is not None and not source_domain.strip():
+            raise ValueError("source_domain must be nonempty")
+        if type(contract_version) is not int or contract_version < 1:
+            raise ValueError("contract_version must be a positive integer")
+        if not destination_domain or not contract_name:
             raise ValueError("invalid boundary consumer contract")
+        if not callable(handler):
+            raise ValueError("boundary consumer handler must be callable")
+        key = (source_domain, destination_domain, contract_name, contract_version)
         if key in self._handlers:
             raise ValueError(
                 "boundary consumer already registered: "
-                f"{destination_domain}:{contract_name}.v{contract_version}"
+                f"{source_domain}:{destination_domain}:{contract_name}.v{contract_version}"
             )
         self._handlers[key] = handler
 
     def contracts_for(self, destination_domain: str) -> frozenset[tuple[str, int]]:
-        """Return the registered contract names and versions owned by one domain."""
+        """Return contract names/versions available at a destination."""
         return frozenset(
             (contract_name, version)
-            for domain, contract_name, version in self._handlers
+            for _, domain, contract_name, version in self._handlers
             if domain == destination_domain
+        )
+
+    def contracts_for_source(
+        self, *, source_domain: str, destination_domain: str,
+    ) -> frozenset[tuple[str, int]]:
+        """Only exact producer registrations count as admission evidence."""
+        return frozenset(
+            (name, version)
+            for src, dst, name, version in self._handlers
+            if src == source_domain and dst == destination_domain
         )
 
     def resolve(self, message: BoundaryMessage) -> BoundaryHandler:
         key = (
-            message.destination_domain,
-            message.contract_name,
-            message.contract_version,
+            message.source_domain, message.destination_domain,
+            message.contract_name, message.contract_version,
         )
         handler = self._handlers.get(key)
+        if handler is None:
+            # Destination-only consumers remain executable solely when no
+            # explicit source-qualified handler exists for this contract.
+            # They never count as organization admission evidence.
+            if any(
+                source is not None and (destination, name, version) == key[1:]
+                for source, destination, name, version in self._handlers
+            ):
+                raise UnsupportedBoundaryContractError(
+                    "unsupported producer boundary contract: "
+                    f"{message.source_domain}:{message.destination_domain}:{message.contract_key}"
+                )
+            handler = self._handlers.get((None, *key[1:]))
         if handler is None:
             raise UnsupportedBoundaryContractError(
                 "unsupported boundary contract: "
