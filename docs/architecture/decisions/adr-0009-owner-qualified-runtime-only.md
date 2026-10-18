@@ -1,4 +1,4 @@
-# ADR-0008 — Owner-qualified durable runtime only
+# ADR-0009 — Owner-qualified durable runtime only
 
 - **Status:** Proposed; acceptance blocked by #504 / PR #506 exact-HEAD gates.
 - **Date:** 2026-10-14
