@@ -25,6 +25,7 @@ from sose.organizational import od5a_recurring
 from sose.organizational.od5a_recurring import (
     SharedPhysicalGrantAuthority, SharedPhysicalPoolBinding,
     initialize_od5a_recurring_job, run_od5a_recurring_tick,
+    suggest_od5a_shared_wait_slots,
 )
 from sose.organizational.od5a_durable import _ORIGIN, od5a_durable_state
 from sose.persistence.postgres import PostgresPersistence
@@ -445,3 +446,367 @@ def test_pg_corrupted_wait_payload_cannot_be_replayed_as_immutable_authority(cor
         assert store.temporal_resources().reservations() == ()
         assert not any(e.owner_id == org for e in store.events())
         assert store.temporal_resources().audit()
+
+def test_pg_shared_wait_advice_is_prospective_and_preserves_all_truth():
+    """A recovered outage can suggest a NEW slot, never an old physical grant."""
+    assert DSN
+    ns = _namespace()
+    org, binding = "org:advice", _binding("unit-1")
+    start = _ORIGIN + timedelta(milliseconds=100)
+    wait_id = deterministic_id(
+        "od5a-shared-capacity-wait", org,
+        deterministic_id("od5a-recurring-tick", org, 1),
+    )
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        outage = TemporalOutage(
+            outage_id="advice:down",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        )
+        ledger = store.temporal_resources()
+        ledger.fail(outage)
+        assert _tick(store, org, binding).action == "waiting"
+        ledger.recover(outage.outage_id, at=start)
+        snapshot = ledger.snapshot()
+        source = _source(store, org)
+        job = store.job_state(org)
+        wait = store.entity("od5a_shared_capacity_wait", wait_id)
+        assert wait is not None and wait.state == "waiting"
+
+        too_early = suggest_od5a_shared_wait_slots(
+            store, job_id=org, shared_pool_binding=binding,
+            not_before=_ORIGIN, latest_start=_ORIGIN,
+        )
+        assert len(too_early) == 1 and too_early[0].suggested_start is None
+        advised = suggest_od5a_shared_wait_slots(
+            store, job_id=org, shared_pool_binding=binding,
+            not_before=start, latest_start=start,
+        )
+        assert len(advised) == 1
+        assert advised[0].reservation_id == wait.attributes["requests"][0]["reservation_id"]
+        assert advised[0].instance_id == "unit-1"
+        assert advised[0].original_start == _ORIGIN
+        assert advised[0].duration == timedelta(seconds=0.2)
+        assert advised[0].suggested_start == start
+        assert ledger.snapshot() == snapshot
+        assert _source(store, org) == source
+        assert store.job_state(org) == job
+        assert store.entity("od5a_shared_capacity_wait", wait_id) == wait
+        assert not any(e.owner_id == org for e in store.events())
+        assert ledger.get(advised[0].reservation_id) is None
+        assert ledger.audit()
+    with PostgresPersistence(DSN, namespace=ns) as reopened:
+        assert suggest_od5a_shared_wait_slots(
+            reopened, job_id=org, shared_pool_binding=binding,
+            not_before=start, latest_start=start,
+        ) == advised
+        assert reopened.temporal_resources().audit()
+
+
+def test_pg_wait_advice_is_stale_after_peer_reserves_suggested_slot():
+    assert DSN
+    ns = _namespace()
+    org, binding = "org:advice-stale", _binding("unit-1")
+    start = _ORIGIN + timedelta(milliseconds=100)
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        ledger = store.temporal_resources()
+        outage = TemporalOutage(
+            outage_id="advice:stale", address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        )
+        ledger.fail(outage)
+        assert _tick(store, org, binding).action == "waiting"
+        ledger.recover(outage.outage_id, at=start)
+        advice = suggest_od5a_shared_wait_slots(
+            store, job_id=org, shared_pool_binding=binding,
+            not_before=start, latest_start=start + timedelta(seconds=1),
+        )
+        assert advice[0].suggested_start == start
+
+    with PostgresPersistence(DSN, namespace=ns) as contender:
+        from sose.core.resource_reservations import TemporalReservation
+        contender.temporal_resources().reserve(TemporalReservation(
+            reservation_id="another-owner", owner_id="org:contender",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=start, end_at=start + timedelta(seconds=0.2),
+            causation_id="independent:physical-event",
+        ))
+    with PostgresPersistence(DSN, namespace=ns) as reopened:
+        next_advice = suggest_od5a_shared_wait_slots(
+            reopened, job_id=org, shared_pool_binding=binding,
+            not_before=start, latest_start=start + timedelta(seconds=1),
+        )
+        assert next_advice[0].suggested_start == start + timedelta(seconds=0.2)
+        assert reopened.temporal_resources().audit()
+
+
+def test_pg_wait_advice_rejects_corrupted_causal_wait_record():
+    assert DSN
+    ns = _namespace()
+    org, binding = "org:advice-forged", _binding("unit-1")
+    trigger = deterministic_id("od5a-recurring-tick", org, 1)
+    wait_id = deterministic_id("od5a-shared-capacity-wait", org, trigger)
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        store.temporal_resources().fail(TemporalOutage(
+            outage_id="advice:forged",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        ))
+        assert _tick(store, org, binding).action == "waiting"
+        with store.transaction() as uow:
+            wait = uow.get_entity("od5a_shared_capacity_wait", wait_id)
+            wait.attributes["requests"][0]["instance_id"] = "unit-2"
+            uow.save_entity(wait)
+        source = _source(store, org)
+        with pytest.raises(ResourceConflictError, match="wait record contradicts"):
+            suggest_od5a_shared_wait_slots(
+                store, job_id=org, shared_pool_binding=binding,
+                not_before=_ORIGIN, latest_start=_ORIGIN + timedelta(seconds=2),
+            )
+        assert _source(store, org) == source
+        assert store.temporal_resources().reservations() == ()
+        assert store.temporal_resources().audit()
+
+@pytest.mark.parametrize("forgery", ("service", "causal_parent"))
+def test_pg_wait_advice_rejects_mutated_source_after_durable_wait(forgery):
+    """Wait authentication must bind service duration AND causal provenance."""
+    assert DSN
+    ns = _namespace()
+    org, binding = "org:source-forged", _binding("unit-1")
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        store.temporal_resources().fail(TemporalOutage(
+            outage_id="source:down",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        ))
+        assert _tick(store, org, binding).action == "waiting"
+        with store.transaction() as uow:
+            source = uow.get_entity("od5a_durable_pilot", org)
+            assert source is not None
+            if forgery == "service":
+                item = next(iter(source.attributes["services"]))
+                stage = next(iter(source.attributes["services"][item]))
+                source.attributes["services"][item][stage] = 0.9
+            else:
+                # Initial arrival action's item determines the root stage's
+                # deterministic causal event; alter it without changing the
+                # original action identity persisted in the wait.
+                source.attributes["services"]["forged:item"] = {
+                    "a": 0.2, "b": 0.2, "c": 0.1,
+                }
+                # This changes the source's causal contract even though
+                # previewed local resource IDs can remain the same.
+            uow.save_entity(source)
+        with pytest.raises(ResourceConflictError, match="wait record contradicts"):
+            suggest_od5a_shared_wait_slots(
+                store, job_id=org, shared_pool_binding=binding,
+                not_before=_ORIGIN, latest_start=_ORIGIN + timedelta(seconds=2),
+            )
+        assert store.temporal_resources().reservations() == ()
+        assert store.temporal_resources().audit()
+
+
+@pytest.mark.parametrize("forgery", ("empty_owner", "bool_epoch", "wrong_trigger"))
+def test_pg_wait_advice_validates_full_durable_claim_history(forgery):
+    assert DSN
+    ns = _namespace()
+    org, binding = "org:claim-forged", _binding("unit-1")
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        store.temporal_resources().fail(TemporalOutage(
+            outage_id="claim:down",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        ))
+        assert _tick(store, org, binding).action == "waiting"
+        with store.transaction() as uow:
+            lease = uow.get_entity("od5a_runner_lease", org)
+            assert lease is not None
+            if forgery == "empty_owner":
+                lease.attributes["owner_id"] = ""
+            elif forgery == "bool_epoch":
+                lease.attributes["epoch"] = False
+                lease.attributes["staged_sql_mutation"] = True
+            else:
+                lease.attributes["trigger_id"] = "forged-trigger"
+            uow.save_entity(lease)
+        with pytest.raises((ResourceConflictError, ValueError), match="lease|claim"):
+            suggest_od5a_shared_wait_slots(
+                store, job_id=org, shared_pool_binding=binding,
+                not_before=_ORIGIN, latest_start=_ORIGIN + timedelta(seconds=2),
+            )
+        assert store.temporal_resources().reservations() == ()
+
+
+def test_pg_wait_advice_does_not_bootstrap_namespace_or_mutate_ledger(monkeypatch):
+    assert DSN
+    from sose.persistence.postgres_resource_ledger import PostgresTemporalResourceLedger
+    ns = _namespace()
+    org, binding = "org:readonly", _binding("unit-1")
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        ledger = store.temporal_resources()
+        ledger.fail(TemporalOutage(
+            outage_id="readonly:down",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        ))
+        assert _tick(store, org, binding).action == "waiting"
+        snapshot = ledger.snapshot()
+
+        def reject_bootstrap(self):
+            raise AssertionError("read-only advice must not run bootstrap DDL")
+
+        monkeypatch.setattr(PostgresTemporalResourceLedger, "_bootstrap", reject_bootstrap)
+        advice = suggest_od5a_shared_wait_slots(
+            store, job_id=org, shared_pool_binding=binding,
+            not_before=_ORIGIN, latest_start=_ORIGIN + timedelta(seconds=2),
+        )
+        assert advice[0].suggested_start == _ORIGIN + timedelta(seconds=1)
+        assert ledger.snapshot() == snapshot
+        assert ledger.audit()
+
+
+@pytest.mark.parametrize("missing", ("wait_schema_version", "source_digest"))
+def test_pg_downgraded_wait_never_authenticates_retry_or_read_advice(missing):
+    """Deleting a v2 field must not turn it into a trusted legacy waiting claim."""
+    assert DSN
+    ns = _namespace()
+    org, binding = "org:downgrade", _binding("unit-1")
+    trigger = deterministic_id("od5a-recurring-tick", org, 1)
+    wait_id = deterministic_id("od5a-shared-capacity-wait", org, trigger)
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        store.temporal_resources().fail(TemporalOutage(
+            outage_id="downgrade:outage",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        ))
+        assert _tick(store, org, binding).action == "waiting"
+        before = _source(store, org)
+        with store.transaction() as uow:
+            wait = uow.get_entity("od5a_shared_capacity_wait", wait_id)
+            assert wait is not None
+            assert wait.attributes.pop(missing)
+            uow.save_entity(wait)
+        with pytest.raises(ResourceConflictError, match="wait record contradicts"):
+            suggest_od5a_shared_wait_slots(
+                store, job_id=org, shared_pool_binding=binding,
+                not_before=_ORIGIN, latest_start=_ORIGIN + timedelta(seconds=2),
+            )
+        with pytest.raises(ResourceConflictError, match="wait record contradicts"):
+            _tick(store, org, binding)
+        assert _source(store, org) == before
+        assert store.job_state(org).active_trigger_id == trigger
+        assert store.temporal_resources().reservations() == ()
+        assert store.temporal_resources().audit()
+
+
+def test_pg_wait_with_v1_schema_never_acquires_physical_capacity():
+    """Unverifiable historical wait identity is not an execution grant."""
+    assert DSN
+    ns = _namespace()
+    org, binding = "org:pre-v2", _binding("unit-1")
+    trigger = deterministic_id("od5a-recurring-tick", org, 1)
+    wait_id = deterministic_id("od5a-shared-capacity-wait", org, trigger)
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        store.temporal_resources().fail(TemporalOutage(
+            outage_id="pre-v2:down",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        ))
+        assert _tick(store, org, binding).action == "waiting"
+        with store.transaction() as uow:
+            wait = uow.get_entity("od5a_shared_capacity_wait", wait_id)
+            assert wait is not None
+            wait.attributes.pop("source_digest")
+            wait.attributes.pop("wait_schema_version")
+            uow.save_entity(wait)
+        store.temporal_resources().recover(
+            "pre-v2:down", at=_ORIGIN,
+        )
+        before = _source(store, org)
+        with pytest.raises(ResourceConflictError, match="wait record contradicts"):
+            _tick(store, org, binding)
+        assert _source(store, org) == before
+        assert store.temporal_resources().reservations() == ()
+        assert store.temporal_resources().audit()
+
+
+def test_pg_missing_wait_entity_cannot_launder_a_blocked_claim_into_a_grant():
+    """Durable runner marker survives independent deletion of the wait record."""
+    assert DSN
+    from psycopg import sql
+    ns = _namespace()
+    org, binding = "org:lost-wait", _binding("unit-1")
+    trigger = deterministic_id("od5a-recurring-tick", org, 1)
+    wait_id = deterministic_id("od5a-shared-capacity-wait", org, trigger)
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        ledger = store.temporal_resources()
+        ledger.fail(TemporalOutage(
+            outage_id="lost-wait:outage",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        ))
+        assert _tick(store, org, binding).action == "waiting"
+        with store.transaction() as uow:
+            lease = uow.get_entity("od5a_runner_lease", org)
+            assert lease.attributes["physical_wait_id"] == wait_id
+
+        # Fault inject direct deletion of exactly this durable wait, with
+        # the independent claimed-lease marker intentionally left intact.
+        with store._connection.transaction():
+            deleted = store._connection.execute(sql.SQL("""
+                DELETE FROM {} WHERE collection = 'entities'
+                AND record_key LIKE %s
+            """).format(store._record_table), (f"%{wait_id}%",))
+            assert deleted.rowcount == 1
+        ledger.recover("lost-wait:outage", at=_ORIGIN)
+
+    with PostgresPersistence(DSN, namespace=ns) as reopened:
+        assert reopened.entity("od5a_shared_capacity_wait", wait_id) is None
+        assert reopened.entity("od5a_runner_lease", org).attributes["physical_wait_id"] == wait_id
+        source_before = _source(reopened, org)
+        with pytest.raises(ResourceConflictError, match="pending physical wait|missing shared wait"):
+            _tick(reopened, org, binding)
+        assert _source(reopened, org) == source_before
+        assert reopened.temporal_resources().reservations() == ()
+        assert reopened.job_state(org).active_trigger_id == trigger
+        assert reopened.temporal_resources().audit()
+
+
+def test_pg_missing_wait_marker_cannot_be_ignored_by_advice_or_execution():
+    assert DSN
+    ns = _namespace()
+    org, binding = "org:lost-marker", _binding("unit-1")
+    trigger = deterministic_id("od5a-recurring-tick", org, 1)
+    wait_id = deterministic_id("od5a-shared-capacity-wait", org, trigger)
+    with PostgresPersistence(DSN, namespace=ns) as store:
+        _seed(store, org, binding)
+        ledger = store.temporal_resources()
+        ledger.fail(TemporalOutage(
+            outage_id="lost-marker:outage",
+            address=binding.pool.address(instance_id="unit-1"),
+            start_at=_ORIGIN, end_at=_ORIGIN + timedelta(seconds=1),
+        ))
+        assert _tick(store, org, binding).action == "waiting"
+        with store.transaction() as uow:
+            lease = uow.get_entity("od5a_runner_lease", org)
+            assert lease.attributes.pop("physical_wait_id") == wait_id
+            uow.save_entity(lease)
+        ledger.recover("lost-marker:outage", at=_ORIGIN)
+        with pytest.raises(ResourceConflictError, match="pending physical wait|missing shared wait"):
+            suggest_od5a_shared_wait_slots(
+                store, job_id=org, shared_pool_binding=binding,
+                not_before=_ORIGIN, latest_start=_ORIGIN + timedelta(seconds=1),
+            )
+        with pytest.raises(ResourceConflictError, match="pending physical wait|missing shared wait"):
+            _tick(store, org, binding)
+        assert ledger.reservations() == ()
+        assert ledger.audit()

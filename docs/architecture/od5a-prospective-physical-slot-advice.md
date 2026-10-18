@@ -59,6 +59,48 @@ falsifiers prove that race, physical outage/recovery, half-open intervals,
 fungible capacity boundaries, no retroactive start and zero ledger writes
 during advice, including independent reconnect.
 
+## Read-only bridge from a durable shared wait (#532)
+
+`suggest_od5a_shared_wait_slots(store, job_id, shared_pool_binding,
+not_before, latest_start)` reads an existing `od5a_shared_capacity_wait`
+and returns typed per-instance hints, never a physical grant, source
+`ScheduledWork` mutation or a jointly admissible reschedule.
+
+The query uses an explicit non-bootstrapping physical ledger reader:
+`PostgresPersistence.temporal_resources(bootstrap=False)`. This requires an
+already initialized namespace but does **not** create tables or indexes, and
+does not take a namespace-wide DDL advisory lock for unrelated organizations.
+The read path still uses the source's own organizational lock to obtain a
+stable snapshot; it does not acquire a pool-wide booking lock.
+
+The durable wait now records `wait_schema_version=2` and a canonical
+SHA-256 digest of the full preflight source attributes, in addition to the
+previous exact action, trigger, pool-binding fingerprint, epochs and grant IDs.
+A second independent durable witness, `physical_wait_id`, is placed on
+the claimed runner lease *in the same SQL transaction* that first creates the
+waiting entity. It is carried unchanged across fenced recovery epochs.
+Advice, retry, and physical source commit verify the bidirectional link;
+deleting either side causes fail-closed refusal, not an apparent first
+attempt. A successful committed action atomically marks the wait satisfied
+and removes the lease marker before the lease is released.
+The read-side preview validates that digest and the complete claimed-lease
+lifecycle before reconstructing exact service intervals and performing
+individual `suggest_next_start` calls.
+
+**Compatibility and tampering boundary:** schema-less (pre-v2) waits
+and v2 waits missing `source_digest` are **not authorized** for either
+prospective advice or a physical source retry. If the runner accepted a v2
+wait after those fields were removed, a corrupted record could masquerade
+as the old schema and bypass provenance checking. Existing pre-v2 waits must
+be quarantined for independent reconciliation; there is no inferred historic
+digest, automatic migration, or silent physical execution. This explicitly
+tightens the earlier compatibility rule to fail closed.
+
+Hints may become stale immediately, may not jointly fit if multiple grants
+share capacity, and never permit execution. All eventual rescheduling must be
+versioned, preserve immutable exogenous demand and original causal identity,
+charge wait/intervention costs, and obtain fresh grants in one fenced commit.
+
 ## Not yet implemented
 
 This PR deliberately does NOT rewrite the OD-5a synthetic arrival/service

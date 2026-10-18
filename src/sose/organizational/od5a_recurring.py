@@ -97,6 +97,7 @@ class SharedPhysicalGrantAuthority:
 
     def __init__(
         self, store: Persistence, binding: SharedPhysicalPoolBinding, owner_id: str,
+        *, bootstrap_ledger: bool = True,
     ) -> None:
         from sose.persistence.postgres import PostgresPersistence
 
@@ -104,7 +105,7 @@ class SharedPhysicalGrantAuthority:
             raise TypeError("shared physical authority requires real PostgreSQL")
         self.binding = binding
         self.owner_id = owner_id
-        self.ledger = store.temporal_resources()
+        self.ledger = store.temporal_resources(bootstrap=bootstrap_ledger)
 
     def guarded_pool(self):
         return self.ledger.guard_pool(self.binding.pool)
@@ -372,6 +373,7 @@ def _assert_completed_released_lease(
         or isinstance(lease.attributes.get("epoch"), bool)
         or lease.attributes["epoch"] < 1
         or lease.attributes["epoch"] < job.run_count
+        or lease.attributes.get("physical_wait_id") is not None
     ):
         raise ValueError("OD-5a completed trigger lacks released lease history")
     if _lease_expiry(lease) <= lease.updated_at:
@@ -406,6 +408,12 @@ def _assert_active_claimed_lease(
         or not isinstance(lease.attributes.get("epoch"), int)
         or isinstance(lease.attributes.get("epoch"), bool)
         or lease.attributes["epoch"] < job.run_count + 1
+        or (
+            lease.attributes.get("physical_wait_id") is not None
+            and lease.attributes["physical_wait_id"] != deterministic_id(
+                "od5a-shared-capacity-wait", job.job_id, job.active_trigger_id,
+            )
+        )
     ):
         raise ValueError("OD-5a active lease contradicts runner claim history")
     try:
@@ -603,6 +611,15 @@ def claim_od5a_recurring_tick(
             # the new epoch, hiding its inconsistent causal trigger or clock.
             if existing.updated_at is None or expiry <= existing.updated_at:
                 raise ValueError("OD-5a runner lease expiry contradicts claim timestamp")
+            pending_physical_wait_id = existing.attributes.get("physical_wait_id")
+            if pending_physical_wait_id is not None and (
+                existing.state != "claimed"
+                or job.active_trigger_id is None
+                or pending_physical_wait_id != deterministic_id(
+                    "od5a-shared-capacity-wait", job_id, job.active_trigger_id,
+                )
+            ):
+                raise ResourceConflictError("pending physical wait marker contradicts claimed trigger")
             if existing.state == "claimed":
                 if epoch < job.run_count + 1:
                     raise ValueError("OD-5a claimed lease epoch predates next run")
@@ -651,6 +668,9 @@ def claim_od5a_recurring_tick(
             "epoch": epoch,
             "expires_at": expires_at.isoformat(),
             "trigger_id": trigger_id,
+            **({
+                "physical_wait_id": pending_physical_wait_id,
+            } if existing is not None and pending_physical_wait_id is not None else {}),
         }
         lease.touch(trusted_now)
         uow.save_entity(lease)
@@ -930,6 +950,200 @@ class _RecurringNativePhysicalArbiter:
 
 
 
+@dataclass(frozen=True, slots=True)
+class SharedPhysicalWaitSlotAdvice:
+    """One physical request's advisory start, never a committed joint grant."""
+
+    reservation_id: str
+    instance_id: str
+    original_start: datetime
+    duration: timedelta
+    suggested_start: datetime | None
+
+
+def _source_wait_digest(source_state: dict) -> str:
+    """Canonical typed snapshot binding a durable wait to its source truth."""
+    return sha256(dumps(
+        source_state, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _validate_shared_wait_record(
+    wait: Entity, *, expected: dict | None, epoch: int,
+) -> None:
+    """Require complete v2 source provenance on reads AND committed retries.
+
+    A missing schema tag or digest cannot be interpreted as legacy: a
+    corrupted v2 wait could otherwise be downgraded by deleting both fields.
+    Pre-v2 historical waits must be quarantined, not re-admitted to physical
+    execution by an unauthenticated fallback.
+    """
+    attributes = wait.attributes
+    origin = attributes.get("origin_epoch")
+    observed = attributes.get("last_claim_epoch")
+    digest = attributes.get("source_digest")
+    version = attributes.get("wait_schema_version")
+    if (
+        wait.state != "waiting"
+        or expected is None
+        or type(origin) is not int or type(observed) is not int
+        or not 1 <= origin <= observed <= epoch
+        or type(version) is not int or version != 2
+        or not isinstance(digest, str) or len(digest) != 64
+        or dumps(attributes, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        != dumps({
+            **expected,
+            "origin_epoch": origin,
+            "last_claim_epoch": observed,
+        }, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    ):
+        raise ResourceConflictError(
+            "shared wait record contradicts native source request or runner epoch"
+        )
+
+
+def _require_shared_wait_marker(
+    lease: Entity, *, wait_id: str, wait_exists: bool,
+) -> None:
+    """Tie a blocked source trigger to an INDEPENDENT durable lease record.
+
+    The marker is saved atomically with the initial wait and carried across
+    recovery epochs. Deleting the wait entity must not restore the source's
+    right to behave like a fresh, never-blocked physical request.
+    """
+    marker = lease.attributes.get("physical_wait_id")
+    if marker is not None and marker != wait_id:
+        raise ResourceConflictError("pending physical wait marker contradicts source trigger")
+    if wait_exists and marker != wait_id:
+        raise ResourceConflictError("pending physical wait lacks its lease marker")
+    if not wait_exists and marker is not None:
+        raise ResourceConflictError("pending physical wait references missing shared wait")
+
+
+def suggest_od5a_shared_wait_slots(
+    store: Persistence, *, job_id: str,
+    shared_pool_binding: SharedPhysicalPoolBinding,
+    not_before: datetime, latest_start: datetime,
+) -> tuple[SharedPhysicalWaitSlotAdvice, ...]:
+    """Read-only bounded hints for a *persisted* blocked source step (#477).
+
+    Reconstruct the exact pending grants through the operational reducer on
+    a disposable view, verify the typed durable wait and its live trigger
+    identity, then query each named physical instance's authoritative ledger.
+    No event, source action, checkpoint, wait record, or grant is changed.
+    Multiple individual hints are NOT a joint reservation or a coherent
+    reschedule. A separate versioned scheduler must revalidate all requests
+    and original causal parents inside its own fenced commit.
+    """
+    # Initialize DDL outside the job transaction; ledger construction has
+    # its own namespace-scoped bootstrap guard, unlike the advisory query.
+    authority = SharedPhysicalGrantAuthority(
+        store, shared_pool_binding, job_id, bootstrap_ledger=False,
+    )
+    ledger = authority.ledger
+    with _job_transaction(store, job_id) as uow:
+        source, job = _read_job(uow, job_id)
+        _assert_shared_binding(source, shared_pool_binding)
+        try:
+            _assert_active_claimed_lease(uow, job)
+        except ValueError as exc:
+            raise ResourceConflictError(
+                "shared wait lacks valid claimed runner lease history"
+            ) from exc
+        trigger_id = job.active_trigger_id
+        lease = uow.get_entity(_LEASE_KIND, job_id)
+        if (
+            trigger_id is None or job.status != "running" or job.phase != "advance"
+            or lease is None or lease.state != "claimed"
+            or lease.attributes.get("trigger_id") != trigger_id
+            or type(lease.attributes.get("epoch")) is not int
+            or lease.attributes["epoch"] < 1
+        ):
+            raise ResourceConflictError("shared wait lacks a current claimed trigger")
+        actions = source.attributes["actions"]
+        if not actions:
+            raise ResourceConflictError("shared wait lacks the original pending action")
+        next_action = dict(min(actions, key=lambda a: (a["at"], a["seq"])))
+        due = next_action["at"]
+        wait_id = deterministic_id("od5a-shared-capacity-wait", job_id, trigger_id)
+        wait = uow.get_entity(_SHARED_WAIT_KIND, wait_id)
+        if wait is None:
+            raise ResourceConflictError("pending physical wait references missing shared wait")
+        _require_shared_wait_marker(lease, wait_id=wait_id, wait_exists=True)
+
+        # Only the source's own local leases are input to this speculative
+        # transition; another organization cannot forge the grant identities.
+        owned_names = {
+            f"{job_id}/{slot}" for slot in source.attributes["resources"]
+        }
+        owned = tuple(
+            item for item in uow.resource_reservations()
+            if item.resource_name in owned_names
+        )
+        preview = _PhysicalStepPreview(owned)
+        planned = deepcopy(source.attributes)
+        _transition(preview, planned, job_id)
+        matched = sorted((
+            (grant, slot)
+            for grant in preview.grants
+            if (slot := authority._slot(grant.resource_name)) is not None
+        ), key=lambda pair: pair[0].reservation_id)
+        requests = [
+            {
+                "resource_name": grant.resource_name,
+                "reservation_id": grant.reservation_id,
+                "request_id": grant.request_id,
+                "instance_id": slot[1],
+            }
+            for grant, slot in matched
+        ]
+        _validate_shared_wait_record(
+            wait,
+            expected={
+                "trigger_id": trigger_id,
+                "binding_fingerprint": shared_pool_binding.fingerprint(),
+                "source_action": next_action,
+                "due_at": _time(due).isoformat(),
+                "requests": requests,
+                "wait_schema_version": 2,
+                "source_digest": _source_wait_digest(source.attributes),
+            },
+            epoch=lease.attributes["epoch"],
+        )
+        if not matched:
+            raise ResourceConflictError("durable shared wait has no physical requests")
+        hints: list[SharedPhysicalWaitSlotAdvice] = []
+        for grant, (local_name, instance) in matched:
+            activity = planned["active"].get(local_name)
+            if activity is None or activity.get("reservation_id") != grant.reservation_id:
+                raise ResourceConflictError("wait request lacks planned physical activity")
+            ends = [
+                action["at"] for action in planned["actions"]
+                if action.get("kind") == "execution_done"
+                and action.get("resource") == local_name
+            ]
+            if len(ends) != 1 or _time(ends[0]) <= grant.acquired_at:
+                raise ResourceConflictError("wait request lacks exact service duration")
+            physical = TemporalReservation(
+                reservation_id=authority._id(grant.reservation_id),
+                address=shared_pool_binding.pool.address(instance_id=instance),
+                owner_id=job_id,
+                start_at=grant.acquired_at,
+                end_at=_time(ends[0]),
+                causation_id=activity["causes"][0],
+            )
+            suggested = ledger.suggest_next_start(
+                physical, not_before=not_before, latest_start=latest_start,
+            )
+            hints.append(SharedPhysicalWaitSlotAdvice(
+                reservation_id=grant.reservation_id, instance_id=instance,
+                original_start=physical.start_at,
+                duration=physical.end_at - physical.start_at,
+                suggested_start=suggested,
+            ))
+        return tuple(hints)
+
+
 def execute_od5a_claimed_tick(
     store: Persistence, *, claim: OD5aRunnerClaim, now: datetime,
     _wall_clock: Callable[[], datetime] | None = None,
@@ -1037,31 +1251,16 @@ def execute_od5a_claimed_tick(
             "source_action": next_action,
             "due_at": _time(due).isoformat(),
             "requests": wait_requests,
+            "wait_schema_version": 2,
+            "source_digest": _source_wait_digest(preflight_state),
         }
         if authority is not None else None
     )
 
     def validate_wait(wait: Entity, *, epoch: int) -> None:
-        attributes = wait.attributes
-        origin = attributes.get("origin_epoch")
-        observed = attributes.get("last_claim_epoch")
-        if (
-            wait.state != "waiting"
-            or wait_attributes is None
-            or type(origin) is not int or type(observed) is not int
-            or not 1 <= origin <= observed <= epoch
-            # Python equality aliases False == 0 and 0 == 0.0. Persisted
-            # causal actions require exact typed JSON, not loose equality.
-            or dumps(attributes, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            != dumps({
-                **wait_attributes,
-                "origin_epoch": origin,
-                "last_claim_epoch": observed,
-            }, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        ):
-            raise ResourceConflictError(
-                "shared wait record contradicts native source request or runner epoch"
-            )
+        _validate_shared_wait_record(
+            wait, expected=wait_attributes, epoch=epoch,
+        )
 
     def commit_source_step() -> None:
         with _job_transaction(store, claim.organization_id) as uow:
@@ -1084,6 +1283,16 @@ def execute_od5a_claimed_tick(
                 raise StaleOD5aRunnerClaimError(
                     "OD-5a own physical ledger changed before native commit"
                 )
+            # Reconstruct the durable wait/lease cross-reference BEFORE
+            # attempting any real physical grant, even when an entity was
+            # removed by an independent corrupted writer.
+            wait = uow.get_entity(_SHARED_WAIT_KIND, wait_id) if authority else None
+            if authority is not None:
+                _require_shared_wait_marker(
+                    lease, wait_id=wait_id, wait_exists=wait is not None,
+                )
+                if wait is not None:
+                    validate_wait(wait, epoch=claim.epoch)
             # The per-pool guard and source UoW share one PostgreSQL
             # transaction. The guard is scoped to THIS physical pool only.
             # A collision must roll back physical booking AND source/job.
@@ -1109,9 +1318,7 @@ def execute_od5a_claimed_tick(
                     # The same physical/source SQL COMMIT resolves any
                     # previously registered wait; a worker dying after COMMIT
                     # must never leave an apparently pending request.
-                    wait = uow.get_entity(_SHARED_WAIT_KIND, wait_id)
                     if wait is not None:
-                        validate_wait(wait, epoch=claim.epoch)
                         wait.state = "satisfied"
                         wait.attributes = {
                             **wait.attributes, "last_claim_epoch": claim.epoch,
@@ -1128,7 +1335,11 @@ def execute_od5a_claimed_tick(
             )
             uow.save_job_state(job)
             lease.state = "released"
-            lease.attributes = {**lease.attributes, "owner_id": None}
+            lease.attributes = {
+                **{k: v for k, v in lease.attributes.items()
+                   if k != "physical_wait_id"},
+                "owner_id": None,
+            }
             lease.touch(commit_at)
             uow.save_entity(lease)
             dispatched.append(OD5aRecurringStep(
@@ -1150,7 +1361,7 @@ def execute_od5a_claimed_tick(
         # still-owned trigger can durably acknowledge backpressure in a NEW
         # fenced transaction. Another org/pool never waits on this job lock.
         with _job_transaction(store, claim.organization_id) as uow:
-            source, job, _ = _assert_claim(
+            source, job, lease = _assert_claim(
                 uow, claim, _trusted_now(store, _wall_clock),
             )
             _assert_shared_binding(source, shared_pool_binding)
@@ -1163,6 +1374,9 @@ def execute_od5a_claimed_tick(
                     "OD-5a source/physical state changed before durable wait"
                 )
             wait = uow.get_entity(_SHARED_WAIT_KIND, wait_id)
+            _require_shared_wait_marker(
+                lease, wait_id=wait_id, wait_exists=wait is not None,
+            )
             if wait is not None:
                 validate_wait(wait, epoch=claim.epoch)
             # Fencing must use the timestamp of THIS durable write, not the
@@ -1180,6 +1394,11 @@ def execute_od5a_claimed_tick(
                 )
                 wait.touch(stamp)
                 uow.save_entity(wait)
+                lease.attributes = {
+                    **lease.attributes, "physical_wait_id": wait_id,
+                }
+                lease.touch(stamp)
+                uow.save_entity(lease)
             elif wait.attributes["last_claim_epoch"] != claim.epoch:
                 wait.attributes = {
                     **wait.attributes, "last_claim_epoch": claim.epoch,
@@ -1245,6 +1464,7 @@ def run_od5a_recurring_tick(
 
 __all__ = [
     "SharedPhysicalPoolBinding", "SharedPhysicalGrantAuthority",
+    "SharedPhysicalWaitSlotAdvice", "suggest_od5a_shared_wait_slots",
     "OD5aRunnerClaim", "OD5aRecurringStep", "StaleOD5aRunnerClaimError",
     "initialize_od5a_recurring_job", "claim_od5a_recurring_tick",
     "execute_od5a_claimed_tick", "run_od5a_recurring_tick",
