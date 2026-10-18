@@ -81,6 +81,18 @@ class PostgresTemporalResourceLedger:
                 sql.Identifier(f"{self._store.namespace}_resource_booking_interval_idx"),
                 self._reservations,
             ))
+            # GiST's native timestamptz-range overlap operator constrains
+            # BOTH endpoints of a bounded query, including long past and
+            # arbitrarily distant future intervals. No btree_gist extension.
+            # [start, effective_end) encodes released/preempted bookings and
+            # an instantaneous stop as an empty range. Namespace-safe names.
+            self._db.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {} ON {} USING gist
+                    (tstzrange(start_at, COALESCE(stopped_at, end_at), '[)'))
+            """).format(
+                sql.Identifier(f"{self._store.namespace}_rb_window_gist"),
+                self._reservations,
+            ))
             self._db.execute(sql.SQL("""
                 CREATE TABLE IF NOT EXISTS {} (
                     outage_id TEXT PRIMARY KEY,
@@ -94,6 +106,24 @@ class PostgresTemporalResourceLedger:
                            (recovered_at >= start_at AND recovered_at <= end_at))
                 )
             """).format(self._outages, self._pools))
+            self._db.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {} ON {} USING gist
+                    (tstzrange(start_at, COALESCE(recovered_at, end_at), '[)'))
+            """).format(
+                sql.Identifier(f"{self._store.namespace}_ro_window_gist"),
+                self._outages,
+            ))
+            # Temporal GiST alone scans simultaneous outages for EVERY
+            # unrelated pool. An independent pool-key B-tree lets the planner
+            # select or bitmap-AND a single pool even when many others occupy
+            # the same time window. Bookings already have a pool-key-leading
+            # B-tree; this closes the missing outage access path.
+            self._db.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {} ON {} (pool_key)
+            """).format(
+                sql.Identifier(f"{self._store.namespace}_ro_pool_idx"),
+                self._outages,
+            ))
             self._db.execute(sql.SQL("""
                 CREATE TABLE IF NOT EXISTS {} (
                     event_id TEXT PRIMARY KEY,
@@ -168,8 +198,8 @@ class PostgresTemporalResourceLedger:
         data["instance_ids"] = tuple(data["instance_ids"])
         return ResourcePoolContract(**data)
 
-    def _booking(self, row) -> TemporalReservation:
-        pool = self._pool(row[1])
+    def _booking(self, row, *, pool: ResourcePoolContract | None = None) -> TemporalReservation:
+        pool = pool or self._pool(row[1])
         return TemporalReservation(
             reservation_id=row[0], address=pool.address(instance_id=row[2]),
             owner_id=row[3], start_at=row[4], end_at=row[5],
@@ -193,8 +223,8 @@ class PostgresTemporalResourceLedger:
         """).format(self._reservations), (key,)).fetchall()
         return tuple(self._booking(row) for row in rows)
 
-    def _outage(self, row) -> TemporalOutage:
-        pool = self._pool(row[1])
+    def _outage(self, row, *, pool: ResourcePoolContract | None = None) -> TemporalOutage:
+        pool = pool or self._pool(row[1])
         return TemporalOutage(
             outage_id=row[0], address=pool.address(instance_id=row[2]),
             start_at=row[3], end_at=row[4], recovered_at=row[5],
@@ -220,6 +250,11 @@ class PostgresTemporalResourceLedger:
         # A pool outage forbids all allocation; a named instance outage only
         # forbids that instance. Unavailability is evaluated over the interval.
         for outage in outages:
+            # A recovery at outage.start_at is a legitimate zero-length
+            # physical outage. Half-open intervals cannot overlap an empty
+            # interval, even when the requested service spans that instant.
+            if outage.effective_end <= outage.start_at:
+                continue
             if (outage.address.instance_id is None or
                 outage.address.instance_id == requested.address.instance_id):
                 if cls._overlap(requested.start_at, requested.end_at,
@@ -259,6 +294,114 @@ class PostgresTemporalResourceLedger:
                            occurred_at, causation_event_id)
             VALUES (%s,%s,%s,%s,%s,%s)
         """).format(self._events), (event_id, key, subject, action, at, cause))
+
+    def _window_bookings(
+        self, key: str, pool: ResourcePoolContract, *, start: datetime,
+        end: datetime,
+    ) -> tuple[TemporalReservation, ...]:
+        """Read only booking intervals overlapping the finite advice horizon."""
+        rows = self._db.execute(sql.SQL("""
+            SELECT reservation_id, pool_key, instance_id, owner_id, start_at,
+                   end_at, units, priority, status, stopped_at, causation_id
+            FROM {} WHERE pool_key = %s
+              AND tstzrange(start_at, COALESCE(stopped_at, end_at), '[)')
+                  && tstzrange(%s, %s, '[)')
+            ORDER BY reservation_id
+        """).format(self._reservations), (key, start, end)).fetchall()
+        return tuple(self._booking(row, pool=pool) for row in rows)
+
+    def _window_outages(
+        self, key: str, pool: ResourcePoolContract, *, start: datetime,
+        end: datetime,
+    ) -> tuple[TemporalOutage, ...]:
+        """Ignore historical outages that cannot constrain any candidate."""
+        rows = self._db.execute(sql.SQL("""
+            SELECT outage_id, pool_key, instance_id, start_at, end_at, recovered_at
+            FROM {} WHERE pool_key = %s
+              AND tstzrange(start_at, COALESCE(recovered_at, end_at), '[)')
+                  && tstzrange(%s, %s, '[)')
+            ORDER BY outage_id
+        """).format(self._outages), (key, start, end)).fetchall()
+        return tuple(self._outage(row, pool=pool) for row in rows)
+
+    def suggest_next_start(
+        self, request: TemporalReservation, *, not_before: datetime,
+        latest_start: datetime,
+    ) -> datetime | None:
+        """Read-only, prospective interval feasibility *advice*, NOT a grant.
+
+        Evaluate one exact immutable physical instance or fungible pool,
+        preserving request duration, units and owner. Capacity can improve
+        only when an existing booking or outage ends; enumerate those finite
+        durable end boundaries rather than sampling a worker-local clock or
+        rewinding the rejected request into the past.
+
+        The result is intentionally NOT a reservation or a promise. Every
+        consumer must separately admit a rescheduled source action, then
+        call reserve in its own fenced authoritative UoW. Another owner may
+        legitimately book the suggested interval immediately after this
+        read; that transaction MUST still fail closed on physical overlap.
+        """
+        if not isinstance(request, TemporalReservation) or request.status != "reserved":
+            raise ValueError("prospective advice requires a new active TemporalReservation")
+        _aware(not_before, "not_before")
+        _aware(latest_start, "latest_start")
+        if not_before < request.start_at:
+            raise ValueError("prospective advice cannot start before original demand")
+        if latest_start < not_before:
+            raise ValueError("latest_start precedes not_before")
+        key = (request.address.lock_key() if request.address.instance_id is None
+               else replace(request.address, instance_id=None).lock_key())
+        # Advisory hint only: intentionally DO NOT take a pool advisory lock.
+        # In an outer SQL transaction that lock could escape the method and
+        # block unrelated writers. The later authoritative reserve owns the
+        # real lock and revalidates all capacity under concurrent writes.
+        try:
+            horizon_end = latest_start + (request.end_at - request.start_at)
+        except OverflowError as exc:
+            raise ValueError("prospective horizon overflows datetime") from exc
+        with self._db.transaction():
+            pool = self._pool(key)
+            if pool.address() != replace(request.address, instance_id=None):
+                raise ResourceConflictError("suggested physical pool identity mismatch")
+            if pool.instance_ids:
+                if request.address.instance_id is None:
+                    raise ValueError("instanced resource requires exact physical instance")
+                pool.address(instance_id=request.address.instance_id)
+            elif request.address.instance_id is not None:
+                raise ValueError("fungible pool cannot request a physical instance")
+            if self._get_booking(request.reservation_id) is not None:
+                raise ResourceConflictError(
+                    "already-booked reservation identity cannot be rescheduled by advice"
+                )
+            bookings = self._window_bookings(
+                key, pool, start=not_before, end=horizon_end,
+            )
+            outages = self._window_outages(
+                key, pool, start=not_before, end=horizon_end,
+            )
+            duration = request.end_at - request.start_at
+            candidates = {not_before}
+            for booking in bookings:
+                if (not pool.instance_ids
+                        or booking.address.instance_id == request.address.instance_id):
+                    if not_before < booking.effective_end <= latest_start:
+                        candidates.add(booking.effective_end)
+            for outage in outages:
+                if (outage.address.instance_id is None
+                        or outage.address.instance_id == request.address.instance_id):
+                    if not_before < outage.effective_end <= latest_start:
+                        candidates.add(outage.effective_end)
+            for start in sorted(candidates):
+                try:
+                    proposal = replace(
+                        request, start_at=start, end_at=start + duration,
+                    )
+                except (OverflowError, ValueError):
+                    continue
+                if self._fits(pool, proposal, bookings, outages):
+                    return start
+            return None
 
     def reserve(self, request: TemporalReservation, *, preempt: bool = False) -> TemporalReservation:
         if not isinstance(request, TemporalReservation) or request.status != "reserved":
@@ -572,6 +715,11 @@ class PostgresTemporalResourceLedger:
                 elif sum(b.units for b in live) > pool.capacity:
                     raise ResourceConflictError("historical capacity overcommit")
                 for o in outages:
+                    # Recovery at the exact outage start makes [t,t)
+                    # empty. Both admission and historical audit must agree
+                    # that no positive-length booking can overlap it.
+                    if o.effective_end <= o.start_at:
+                        continue
                     if not self._overlap(start, end, o.start_at, o.effective_end):
                         continue
                     for b in live:
