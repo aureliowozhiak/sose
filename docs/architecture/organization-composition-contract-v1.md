@@ -1,6 +1,6 @@
 # Organization Composition — initial configuration contract (issue #495)
 
-Status: **v1 structural contract (#499), fail-closed registry metadata admission (#510/#534), and positive, source-pinned static UTC calendar (#535)** implemented. [ADR-0008](decisions/adr-0008-organization-composition-admission.md) remains **Proposed pending independent bounded static ratification (#538)**; runtime composition remains unimplemented (#496).
+Status: **bounded static v1 contract accepted**, subject to exact-head reviewed #535 and this ratification; [ADR-0008](decisions/adr-0008-organization-composition-admission.md) is accepted **only for static metadata/provenance admission**. Dynamic organizational runtime composition remains unimplemented (#496).
 Follow-up: #496 executable runtime, #497 O2C/MRO domain falsifier, #468/#489 concurrency, #477 physical adapter.
 Master plan: #494; proposed documentation: #498.
 
@@ -111,7 +111,7 @@ The CI and historical three-domain replay on
 [#510](https://github.com/brunolnetto/sose/pull/510) passed before merge
 [`11af3b9`](https://github.com/brunolnetto/sose/commit/11af3b96c952b0c8cf4afa5d85ec646c8b90d6e9).
 
-## ADR — proposed static v1 boundary, with runtime explicitly separate
+## ADR — accepted static v1 boundary, with runtime explicitly separate
 
 **Decision:** put these immutable composition-definition types **above the
 generic SOSE kernel** in the existing composition package. Preserve the
@@ -134,7 +134,7 @@ Those require separate, fail-closed execution and persistence contracts.
 existing #477 and prospective freeze gates; O2C/MRO #497 and actor or
 management lifecycle features do not retroactively gate it.
 
-## #495 acceptance reconciliation (static ratification pending)
+## #495 acceptance reconciliation (bounded static ratification)
 
 | Original criterion | Demonstrated in `main` | Still unproven / necessary decision |
 | --- | --- | --- |
@@ -145,17 +145,20 @@ management lifecycle features do not retroactively gate it.
 | Physical resources | Named external pool references with explicit owner IDs and known consumer IDs; duplicate pool IDs rejected (#499) | Pool existence, calendar/instance/capacity and transactional ownership checked against one authoritative ledger |
 | Causal execution | Exact registry admission but **no runnable composition** (#510) | Publication → claim → fenced ACK → Command → certified effect across components with restart and local clocks (#496) |
 | Read model / governance | Architectural separation described by [composition-admission ADR-0008](decisions/adr-0008-organization-composition-admission.md) | Derived consistent snapshots, optional authority-changing governance StateChart and failure-path conformance (#496) |
-| Architecture ratification | [ADR-0008](decisions/adr-0008-organization-composition-admission.md) still **Proposed** pending independent static acceptance (#538), with #499/#510/#512/#530/#534 metadata tests and #535's positive pinned UTC calendar schema and byte provenance | Review bounded #495 ratification; dynamic policy/epoch/cost execution and job lifecycle are #496; live ADR-0009 remains separate |
+| Architecture ratification | [ADR-0008](decisions/adr-0008-organization-composition-admission.md) **Accepted for bounded static admission only**: #499/#510/#512/#530/#534 plus #535 closed UTC calendar source verified against independently pinned canonical bytes and forged declared references | Dynamic policy/epoch/cost execution and job lifecycle are #496; [ADR-0009](decisions/adr-0009-owner-qualified-runtime-only.md) is a **separate** unratified live runtime decision |
 
-**Current decision (#495): static schema implemented, ratification pending.**
-ADR-0008 stays Proposed until independent review (#538). The pure #535
-calendar verifier positively checks a shipped, explicitly Monday-zero UTC
-schedule against canonical bytes and an independently fixed SHA-256;
-negative tests reject forged declared references and contradictory windows.
-This **does not install a calendar in the running organization** or make
-arbitrary caller-provided source hashes attested. Registry admission still
-rejects unknown manifests, all operational references and unaudited physical
-pools. Treating a declared digest as executable authority remains prohibited.
+**Static decision (#495): bounded architecture ratification.** Positive
+static calendar source validation and independently pinned byte provenance
+were supplied by #535. Invalid calendar payloads, ambiguous Monday-zero
+weekday numbering, duplicate keys, unordered/overlapping windows, forged
+reference IDs/versions/digests and contradictory epochs fail closed.
+Unverified physical pools and all executable operational references remain
+blocked. This does **not** imply arbitrary external policies or cost models
+are positively verified: their structural *references* are typed but remain
+non-executable and unsupported without separately attested bytes/authority.
+Promotion gates for the parent and this ratification PR are enforced in
+GitHub before integration. The merged document records the accepted static
+scope; it is not an executable admission of third-party configurations.
 
 **Separate operational work:** exact owner-qualified dispatch, dynamic
 `config_epoch` fencing/migration, actual policy/calendar/cost execution,
@@ -184,8 +187,10 @@ The independent static verifier is **not executable runtime admission**:
 references, including a correctly pinned calendar, until #496 installs and
 certifies evaluation/authority/fencing. Neither calendar shape nor source hash
 creates actor eligibility, physical occupation, policy or cost semantics.
-The broader #495 calendar catalog/ratification decision remains subject to
-independent review; do not infer accepted ADR-0008 from this example alone.
+ADR-0008 accepts only the bounded static source/provenance and fail-closed
+metadata contract after independent review and #535 integration. It does
+not attest arbitrary user calendars or executable policy/cost semantics;
+#496 requires a separate runtime-authority/epoch-migration certification.
 
 ## Operational configuration: structural facts are not installed capabilities (#530)
 
@@ -202,14 +207,15 @@ Because no audited operational configuration registry with policy/calendar/cost
 semantics exists yet, **`validate_organization_admission` refuses any definition
 that has such references**. An arbitrary configuration hash supplied by a caller
 must not self-attest existence, authority, calendar availability or cost.
-A **bounded positive static calendar payload/schema** with independently
-pinned source bytes and invalid-window rejection is now implemented in #535;
-independent architecture ratification remains #538. **Runtime** calendar/policy/cost evaluation, executable registry
+The bounded **static calendar payload/schema** (including independently
+pinned source bytes/digest and invalid-window rejection) is proven by #535; **Runtime** calendar/policy/cost evaluation, executable registry
 attestation, dynamic config-epoch migration and stale-worker fencing are #496;
 not silently treated as complete by the static definition.
 
 The separate owner-qualified durable runtime decision is
 [ADR-0009](decisions/adr-0009-owner-qualified-runtime-only.md);
-admission of structural composition remains the **proposed, bounded v1**
+admission of structural composition is the **accepted, bounded static v1**
 [ADR-0008](decisions/adr-0008-organization-composition-admission.md).
-Digest claims are not independently attested, and neither this contract nor distinct ADR-0009 is ratified by a syntactically valid reference.
+Arbitrary digest claims remain unverified: only the shipped pinned UTC source
+has independent static byte provenance. No syntactically valid reference
+ratifies the separate live ADR-0009.
