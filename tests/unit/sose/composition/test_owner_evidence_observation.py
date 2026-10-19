@@ -56,13 +56,19 @@ def observe(spec, store, *, catalog=None):
     )
 
 
-def append(store, *, owner, kind, event_id):
+def append(store, *, owner, kind, event_id,
+           name="entity.state_transition", payload=None):
+    if payload is None:
+        payload = {
+            "trigger": "assign", "from_state": "eligible",
+            "to_state": "active",
+        }
     with store.transaction(owner_id=owner) as uow:
         uow.append_event(DomainEvent(
-            event_id=event_id, name="fixture.owned",
+            event_id=event_id, name=name,
             entity_type=kind, entity_id="entity:" + event_id,
             occurred_at=NOW, owner_id=owner,
-            payload={"fixture": True},
+            payload=payload,
         ))
 
 
@@ -141,3 +147,47 @@ def test_observation_refuses_self_attested_pool_before_any_persistence_read():
 
     with pytest.raises(ValueError, match="authoritative resource"):
         observe(invalid, NeverRead())
+
+
+@pytest.mark.parametrize("adapter", ("memory", "sqlite"))
+def test_entity_type_alone_cannot_invent_statechart_transition_evidence(adapter, tmp_path):
+    """Same owner/type with unrelated DomainEvent name is not StateChart evidence."""
+    path = tmp_path / "non-statechart.sqlite"
+    store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
+    catalog = builtin_catalog()
+    kind = registered_type(catalog, "warehouse_fulfillment", "FulfillmentOrderChart")
+    try:
+        append(store, owner="org:a", kind=kind, event_id="not-a-transition",
+               name="component.config_change", payload={"source": "unaudited"})
+        append(store, owner="org:a", kind=kind, event_id="verified-transition")
+        before = tuple(store.events())
+        projected = observe(definition(), store, catalog=catalog)
+        assert projected.components[0].event_ids == ("verified-transition",)
+        assert tuple(store.events()) == before
+    finally:
+        if adapter == "sqlite":
+            store.close()
+    if adapter == "sqlite":
+        with SQLitePersistence(path) as recovered:
+            assert observe(definition(), recovered, catalog=catalog) == projected
+
+
+@pytest.mark.parametrize("adapter", ("memory", "sqlite"))
+@pytest.mark.parametrize("missing", ("trigger", "from_state", "to_state"))
+def test_malformed_statechart_payload_is_never_reported_as_evidence(adapter, missing, tmp_path):
+    """A forged transition shell cannot be promoted by owner/type alone."""
+    path = tmp_path / ("malformed-" + missing + ".sqlite")
+    store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
+    catalog = builtin_catalog()
+    kind = registered_type(catalog, "warehouse_fulfillment", "FulfillmentOrderChart")
+    payload = {"trigger": "assign", "from_state": "eligible", "to_state": "active"}
+    payload.pop(missing)
+    try:
+        append(store, owner="org:a", kind=kind, event_id="forged", payload=payload)
+        immutable = tuple(store.events())
+        with pytest.raises(ValueError, match="malformed observed StateChart transition"):
+            observe(definition(), store, catalog=catalog)
+        assert tuple(store.events()) == immutable
+    finally:
+        if adapter == "sqlite":
+            store.close()

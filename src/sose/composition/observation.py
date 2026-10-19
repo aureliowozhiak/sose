@@ -86,6 +86,17 @@ def observe_organization_events(
         if event.owner_id not in permitted:
             continue
         if event.entity_type in types_by_owner[event.owner_id]:
+            # Same entity type does not make an arbitrary DomainEvent a
+            # StateChart transition. Enrollment/config events are distinct
+            # evidence families, even when emitted by the same entity.
+            if event.name != "entity.state_transition":
+                continue
+            if not all(
+                isinstance(event.payload.get(field), str)
+                and event.payload[field].strip()
+                for field in ("trigger", "from_state", "to_state")
+            ):
+                raise ValueError("malformed observed StateChart transition payload")
             if event.event_id in seen_ids:
                 raise ValueError("duplicate durable organization event identity")
             seen_ids.add(event.event_id)

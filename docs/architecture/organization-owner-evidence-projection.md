@@ -4,7 +4,11 @@ This is a **bounded, read-only observation** of selected StateChart event
 evidence, not a runnable multi-domain organization. An
 `OrganizationDefinition` must pass the real catalog/process-manifest/consumer
 registry admission rules (ADR-0008). Only the declared exact StateChart
-entity type(s) of each component and its durable owner are used for selection.
+entity type(s) of each component and its durable owner are eligible for selection.
+A selected event must additionally be a correctly shaped `entity.state_transition`
+with explicit string trigger/source/target fields. Other events of the same
+entity type are not silently promoted to StateChart evidence. This structural
+check is not a full Command/causation attestation or authorization.
 
 One `Persistence.events()` call supplies the observed event window; events
 are grouped into each named component in **owner-local append order**.
