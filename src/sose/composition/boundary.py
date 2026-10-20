@@ -196,8 +196,8 @@ class BoundaryService:
         The default None preserves the existing global deterministic claim
         order for old single-worker composition references.
         """
-        if not owner_id:
-            raise ValueError("owner_id cannot be empty")
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("owner_id must be a nonblank string")
         if destination_domain is not None and not destination_domain:
             raise ValueError("destination_domain must be nonempty when specified")
         if message_id is not None and not message_id:
@@ -307,8 +307,8 @@ class BoundaryService:
 
             handler = registry.resolve(message)
             effect_id = handler(message, uow)
-            if not effect_id:
-                raise ValueError("boundary consumer effect identity cannot be empty")
+            if not isinstance(effect_id, str) or not effect_id.strip():
+                raise ValueError("boundary consumer effect identity must be a nonblank string")
 
             consumption = BoundaryConsumption.create(
                 delivery=current,
@@ -454,6 +454,13 @@ class BoundaryService:
         ):
             raise StaleBoundaryClaimError(
                 f"stale boundary claim: {current.delivery_id}"
+            )
+        # A lease clock is independent of the source's logical time, but
+        # its own claim/ACK chronology must still be monotonic. The writer
+        # must never produce an ACK that the read-only observer cannot audit.
+        if current.claimed_at is None or now < current.claimed_at:
+            raise StaleBoundaryClaimError(
+                f"boundary claim clock regressed: {current.delivery_id}"
             )
         if current.lease_expires_at is None or current.lease_expires_at <= now:
             raise StaleBoundaryClaimError(
