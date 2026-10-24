@@ -14,6 +14,7 @@ on:
       - "docs/architecture/decisions/adr-0007-versioned-scientific-freezes.md"
       - "tests/unit/sose/organizational/test_historical_replay_governance.py"
       - "tests/unit/sose/organizational/**"
+      - "tests/integration/sose/examples/warehouse_fulfillment/**"
   push:
     branches: [main]
     paths:
@@ -28,6 +29,7 @@ on:
       - "docs/architecture/decisions/adr-0007-versioned-scientific-freezes.md"
       - "tests/unit/sose/organizational/test_historical_replay_governance.py"
       - "tests/unit/sose/organizational/**"
+      - "tests/integration/sose/examples/warehouse_fulfillment/**"
   workflow_dispatch:
 
 permissions:

@@ -146,3 +146,77 @@ def test_service_duration_and_queue_wait_gate_business_completion() -> None:
     substitute = persistence.entity("warehouse_inventory_lot", entities.lot_ids[1])
     assert primary is not None and primary.attributes["on_hand"] == pytest.approx(0.0)
     assert substitute is not None and substitute.attributes["on_hand"] == pytest.approx(1.0)
+
+
+
+def test_two_pickers_execute_in_parallel_without_early_inventory_consumption() -> None:
+    """W1 missing falsifier: capacity=2 is actually honored, not capped to one.
+
+    The existing capacity=1 case proves a second demand queues. This case
+    catches a broken implementation that silently forces every picker pool
+    to capacity=1, and verifies both service grants, due times, stock effects
+    and eventual finite-capacity release.
+    """
+    persistence, entities, engine, backend = _runtime(picker_capacity=2)
+    order = persistence.entity("warehouse_fulfillment_order", entities.order_id)
+    assert order is not None
+    allocation_ids = tuple(str(v) for v in order.attributes["allocation_ids"])
+    assert len(allocation_ids) == 2
+
+    _reconcile(persistence, entities, engine, backend)
+    tasks = [
+        persistence.entity(
+            "warehouse_fulfillment_service_task",
+            service_task_id("pick", allocation_id),
+        )
+        for allocation_id in allocation_ids
+    ]
+    assert all(task is not None for task in tasks)
+    assert [task.state for task in tasks] == ["in_progress", "in_progress"]
+    assert all(task.attributes["acquired_at"] == ORIGIN.isoformat() for task in tasks)
+    assert all(
+        task.attributes["completion_due_at"]
+        == (ORIGIN + timedelta(hours=1)).isoformat()
+        for task in tasks
+    )
+    reservations = persistence.resource_reservations()
+    assert len(reservations) == 2
+    assert len({reservation.reservation_id for reservation in reservations}) == 2
+    assert {
+        task.attributes["reservation_id"] for task in tasks
+    } == {reservation.reservation_id for reservation in reservations}
+    assert persistence.resource_demands() == ()
+
+    for lot_id, expected in zip(entities.lot_ids, (6.0, 5.0), strict=True):
+        lot = persistence.entity("warehouse_inventory_lot", lot_id)
+        assert lot is not None and lot.attributes["on_hand"] == pytest.approx(expected)
+
+    # A repeated reconcile cannot create ghost reservations/duplicate work.
+    _reconcile(persistence, entities, engine, backend)
+    assert {r.reservation_id for r in persistence.resource_reservations()} == {
+        r.reservation_id for r in reservations
+    }
+    assert persistence.resource_demands() == ()
+
+    backend.run_until(ORIGIN + timedelta(hours=1))
+    _reconcile(persistence, entities, engine, backend)
+    allocations = [
+        persistence.entity("warehouse_allocation", allocation_id)
+        for allocation_id in allocation_ids
+    ]
+    assert all(a is not None and a.state == "picked" for a in allocations)
+    # Picking completed at t=1, but packing/shipping need their own duration.
+    order = persistence.entity("warehouse_fulfillment_order", entities.order_id)
+    assert order is not None and order.state == "picking"
+
+    backend.run_until(ORIGIN + timedelta(hours=2))
+    _reconcile(persistence, entities, engine, backend)
+    order = persistence.entity("warehouse_fulfillment_order", entities.order_id)
+    assert order is not None and order.state == "packed"
+
+    backend.run_until(ORIGIN + timedelta(hours=3))
+    _reconcile(persistence, entities, engine, backend)
+    order = persistence.entity("warehouse_fulfillment_order", entities.order_id)
+    assert order is not None and order.state == "shipped"
+    assert persistence.resource_demands() == ()
+    assert persistence.resource_reservations() == ()
