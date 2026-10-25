@@ -189,3 +189,97 @@ def test_signed_final_predecessor_cannot_hide_missing_earlier_history(adapter, t
     finally:
         if adapter == "sqlite":
             store.close()
+
+
+@pytest.mark.parametrize("adapter", ("memory", "sqlite"))
+@pytest.mark.parametrize("tamper", ("state", "updated_at"))
+def test_trusted_prestate_rejects_modified_projection_after_authentic_allocate(
+    adapter, tamper, tmp_path,
+):
+    """#545: signed history must match the *current durable* predecessor.
+
+    An issuer-authenticated first transition must not authorize a later
+    native transition when a public UoW subsequently rewrites its projection.
+    """
+    path = tmp_path / "signed-predecessor-projection.sqlite"
+    store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
+    order = FulfillmentOrder(
+        id="order:tampered-signed-predecessor", state="requested",
+        created_at=NOW, updated_at=NOW,
+    )
+    try:
+        with store.transaction(owner_id=OWNER) as uow:
+            uow.save_entity(order)
+        runtime = _engine(store)
+        runtime.dispatch(Command(
+            command_id="cmd:first-authentic-allocate", name="allocate",
+            entity_type=order.entity_type, entity_id=order.id, owner_id=OWNER,
+            due_at=NOW, issued_at=NOW,
+            correlation_id="flow:tampered-signed-predecessor",
+        ))
+        first_transition = store.entity(order.entity_type, order.id)
+        assert first_transition.version == 1
+        with store.transaction(owner_id=OWNER) as uow:
+            corrupted = uow.get_entity(order.entity_type, order.id)
+            if tamper == "state":
+                corrupted.state = "requested"
+            else:
+                corrupted.updated_at = NOW + timedelta(seconds=7)
+            uow.save_entity(corrupted)
+
+        recorded_before = tuple(store.events())
+        assert len(recorded_before) == 2  # native transition + protected receipt
+        with pytest.raises(ValueError, match="trusted predecessor chain contradicts"):
+            runtime.dispatch(Command(
+                command_id="cmd:after-public-projection-corruption",
+                name="allocate" if tamper == "state" else "start_pick",
+                entity_type=order.entity_type, entity_id=order.id, owner_id=OWNER,
+                due_at=NOW, issued_at=NOW,
+                correlation_id="flow:tampered-signed-predecessor",
+            ))
+        assert tuple(store.events()) == recorded_before
+        assert store.entity(order.entity_type, order.id).version == 1
+    finally:
+        if adapter == "sqlite":
+            store.close()
+
+
+@pytest.mark.parametrize("adapter", ("memory", "sqlite"))
+def test_trusted_prestate_rejects_version_zero_rewind_with_signed_history(
+    adapter, tmp_path,
+):
+    """A public writer cannot reset version/state and replay an initial transition."""
+    path = tmp_path / "signed-version-rewind.sqlite"
+    store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
+    order = FulfillmentOrder(
+        id="order:rewound-signed-history", state="requested",
+        created_at=NOW, updated_at=NOW,
+    )
+    try:
+        with store.transaction(owner_id=OWNER) as uow:
+            uow.save_entity(order)
+        runtime = _engine(store)
+        runtime.dispatch(Command(
+            command_id="cmd:allocate-before-rewind", name="allocate",
+            entity_type=order.entity_type, entity_id=order.id, owner_id=OWNER,
+            due_at=NOW, issued_at=NOW,
+            correlation_id="flow:rewound-signed-history",
+        ))
+        with store.transaction(owner_id=OWNER) as uow:
+            rewound = uow.get_entity(order.entity_type, order.id)
+            rewound.version = 0
+            rewound.state = "requested"
+            rewound.updated_at = NOW
+            uow.save_entity(rewound)
+        recorded_before = tuple(store.events())
+        with pytest.raises(ValueError, match="version-zero entity"):
+            runtime.dispatch(Command(
+                command_id="cmd:allocate-after-rewind", name="allocate",
+                entity_type=order.entity_type, entity_id=order.id, owner_id=OWNER,
+                due_at=NOW, issued_at=NOW,
+                correlation_id="flow:rewound-signed-history",
+            ))
+        assert tuple(store.events()) == recorded_before
+    finally:
+        if adapter == "sqlite":
+            store.close()
