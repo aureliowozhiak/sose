@@ -64,8 +64,13 @@ def _sha(value):
 
 
 def _source_truth(store, org):
+    source = dict(od5a_durable_state(store, job_id=org))
+    # Only the native-PG adapter stores this explicit immutable external pool
+    # binding; standalone SQLite reference has no physical external address.
+    # Compare its fingerprint independently, never silently erase it.
+    source.pop("shared_pool_binding", None)
     return (
-        od5a_durable_state(store, job_id=org),
+        source,
         od5a_durable_events(store, job_id=org),
         store.resource_demands(),
         store.resource_reservations(),
@@ -131,6 +136,10 @@ def test_pg_native_and_reopened_physical_traces_match_sqlite_reducer_every_step(
                 assert restart_result.action == steady_result.action
                 assert _source_truth(steady, org) == _source_truth(reference, org)
                 assert _source_truth(restarted, org) == _source_truth(reference, org)
+                for native_source in (steady, restarted):
+                    assert od5a_durable_state(
+                        native_source, job_id=org,
+                    )["shared_pool_binding"] == binding.fingerprint()
                 assert _physical_truth(steady) == _physical_truth(restarted)
                 for booked in _physical_truth(restarted):
                     assert booked.owner_id == org
