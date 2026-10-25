@@ -169,3 +169,54 @@ def test_pg_signed_warehouse_ship_is_replayable_but_public_forgery_is_not():
     assert bad_root[0] == "rejected" and "signature invalid" in bad_root[1]
     forged_result = _fresh_verifier(DSN, namespace, forged.event_id, SECRET)
     assert forged_result[0] == "rejected" and "receipt missing" in forged_result[1]
+
+
+@pytest.mark.parametrize("forged_version", (0, 3))
+def test_pg_native_ship_rejects_untrusted_prestate_even_with_valid_issuer(
+    forged_version,
+):
+    """#545: a real issuer cannot sign a successor of public-UoW forgery.
+
+    Version zero at the wrong initial state and a plausible packed/version-3
+    projection without native transition history must both fail BEFORE the
+    actual Engine signs source and attestation into PostgreSQL.
+    """
+    assert DSN is not None
+    namespace = "trusted_prestate_" + uuid4().hex[:12]
+    authority = TransitionAuthority(ISSUER, KEY_ID, SECRET)
+    order = FulfillmentOrder(
+        id="order:public-prestate", state="requested",
+        created_at=NOW, updated_at=NOW,
+    )
+    with PostgresPersistence(DSN, namespace=namespace) as store:
+        with store.transaction(owner_id=OWNER) as uow:
+            uow.save_entity(order)
+        with store.transaction(owner_id=OWNER) as uow:
+            tampered = uow.get_entity(order.entity_type, order.id)
+            tampered.state = "packed"
+            tampered.version = forged_version
+            tampered.updated_at = NOW
+            uow.save_entity(tampered)
+        prior_events = tuple(store.events())
+
+        with pytest.raises(
+            ValueError, match="unauthenticated prestate|trusted predecessor"
+        ):
+            _runtime(store, authority).dispatch(Command(
+                command_id=f"command:forged-prestate:{forged_version}",
+                name="ship", entity_type=order.entity_type,
+                entity_id=order.id, owner_id=OWNER,
+                due_at=NOW, issued_at=NOW,
+                correlation_id="flow:forged-prestate",
+            ))
+
+        assert tuple(store.events()) == prior_events
+        assert store.entity(order.entity_type, order.id).state == "packed"
+        assert store.entity(order.entity_type, order.id).version == forged_version
+
+    with PostgresPersistence(DSN, namespace=namespace) as recovered:
+        assert recovered.entity(order.entity_type, order.id).state == "packed"
+        assert recovered.entity(order.entity_type, order.id).version == forged_version
+        assert not any(
+            event.name == ATTESTATION_EVENT for event in recovered.events()
+        )
