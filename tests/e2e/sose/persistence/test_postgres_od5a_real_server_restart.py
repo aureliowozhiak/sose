@@ -92,6 +92,12 @@ def test_hard_killed_postmaster_recovers_one_native_physical_commit():
         # connection. docker start reuses exactly the same PGDATA directory.
         assert _docker("kill", "--signal=KILL", container) == container
         assert _docker("start", container) == container
+        # Docker may reallocate an ephemeral host port on container restart.
+        # The original DSN is now stale even though container/PGDATA persist.
+        restarted_port = _docker("port", container, "5432/tcp").splitlines()[0]
+        assert restarted_port.startswith("127.0.0.1:"), restarted_port
+        new_port = int(restarted_port.rsplit(":", 1)[1])
+        dsn = f"postgresql://postgres:postgres@127.0.0.1:{new_port}/sose"
         _ready(dsn)
 
         with PostgresPersistence(dsn, namespace=namespace) as recovered:
