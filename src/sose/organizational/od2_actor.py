@@ -411,7 +411,13 @@ def _verify_actor_time_projection(uow, actor: OrganizationalActor) -> None:
     meta = actor.attributes
     if not isinstance(meta, dict) or not isinstance(meta.get("applied_causes"), dict):
         raise ValueError("OD-2 actor-time ledger lacks durable cause index")
-    source_events = tuple(event for event in uow.events() if (
+    events = tuple(uow.events())
+    # One snapshot/index per guard; avoid repeated shared-ledger scans for each
+    # historical actor cost receipt inside an owner-serialized transaction.
+    by_id = {}
+    for event in events:
+        by_id.setdefault(event.event_id, []).append(event)
+    source_events = tuple(event for event in events if (
         event.entity_type == ACTOR_KIND and event.entity_id == actor.id
         and event.name == "entity.state_transition"
     ))
@@ -420,7 +426,8 @@ def _verify_actor_time_projection(uow, actor: OrganizationalActor) -> None:
     amounts = {state: 0 for state in ACTOR_STATES}
     paid_us = 0
     current_state = "admitted"
-    origin = uow.get_event(_actor_time_origin_event_id(actor.id))
+    origins = by_id.get(_actor_time_origin_event_id(actor.id), ())
+    origin = origins[0] if len(origins) == 1 else None
     if (
         origin is None
         or origin.name != "od2.actor_time_origin_recorded"
@@ -493,9 +500,7 @@ def _verify_actor_time_projection(uow, actor: OrganizationalActor) -> None:
                 source=source, model_spec_hash=meta["model_spec_hash"],
                 config_epoch=meta["config_epoch"], cost_us=cost,
             )
-        evidence = tuple(event for event in uow.events() if (
-            event.event_id == expected.event_id
-        ))
+        evidence = by_id.get(expected.event_id, ())
         if len(evidence) != 1 or evidence[0] != expected:
             raise ValueError("OD-2 actor-time original work/nonwork cost evidence missing or modified")
         expected_cause = [
