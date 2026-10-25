@@ -207,12 +207,18 @@ def test_pickup_fails_closed_before_finite_capacity_admission(case):
     [
         ("created", None, (), NOW + timedelta(hours=1)),
         ("created", NOW + timedelta(hours=2), (), NOW + timedelta(hours=3)),
-        ("in_transit", None, (), NOW),
-        ("in_transit", NOW + timedelta(hours=2), (), NOW + timedelta(hours=2)),
+        # These are actual ShipmentChart states: a pickup is already
+        # scheduled or temporarily delayed, but not yet consummated.
+        ("pickup_scheduled", None, (), NOW),
+        ("delayed_pickup", NOW + timedelta(hours=2), (), NOW + timedelta(hours=2)),
         (
-            "in_transit", None,
+            "pickup_scheduled", None,
             (
-                ("wrong-action", NOW + timedelta(minutes=4), "other", "pickup"),
+                # An *earlier* valid-target but wrong-action command must
+                # remain ineligible; a separately foreign-target command
+                # isolates the identity predicate. Mutating either predicate
+                # must change the selected time and fail this regression.
+                ("wrong-action", NOW + timedelta(minutes=4), SHIPMENT, "pickup"),
                 ("valid-late", NOW + timedelta(minutes=30), SHIPMENT, "schedule_pickup"),
                 ("valid-soon", NOW + timedelta(minutes=10), SHIPMENT, "schedule_pickup"),
                 ("wrong-target", NOW, "other", "schedule_pickup"),
