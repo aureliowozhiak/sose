@@ -60,6 +60,30 @@ Physical work and in-flight exit/cancel/transfer are independent #462
 acceptance and remain OPEN. Do not infer real workplace schedules or OD-5b
 causal effects from synthetic windows.
 
+## Wave 1 — bounded causal time/cost projection guard (PR pending)
+
+Before a **new** actor StateChart transition, reconstruct the actor's recorded
+elapsed microseconds by original predecessor state and paid transition cost
+from chronological native `entity.state_transition` events and their persisted
+`Command` records. Require the projected per-state buckets, sum, final
+state, last effective timestamp, charged cost, original cause identities, and
+current assigned work to reconcile. For `assign`/`complete`, verify the
+immutable `od2.actor_work_caused` source receipt in the same snapshot.
+
+Memory and SQLite regression tests corrupt individual buckets (including
+a *zero-sum reclassification*), paid cost, work identity, cause index, and
+time while leaving real history untouched; the next attempted transition
+must fail without appending an event/Command. A legal paid lifecycle and
+SQLite restart are the positive control. Original idempotent replay-specific
+checks remain in their existing order.
+
+**Limit:** this detects inconsistent *mutable projections*; public writers
+can potentially forge matching Command+event metadata. Only a separately
+protected issuer and owner-fenced writer (#545) can establish source
+authenticity. No physical `ResourceReservation`, worker-time consumption,
+independently signed legacy cutover, or cancellation/preemption is asserted.
+Scientific OD-5b admission remains separate.
+
 ## Outstanding #462 acceptance
 
 1. Real worker/process death and simultaneous PostgreSQL actors attempting the
