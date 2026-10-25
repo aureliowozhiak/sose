@@ -229,7 +229,14 @@ def test_trusted_prestate_rejects_modified_projection_after_authentic_allocate(
 
         recorded_before = tuple(store.events())
         assert len(recorded_before) == 2  # native transition + protected receipt
-        with pytest.raises(ValueError, match="trusted predecessor chain contradicts"):
+        # A state rewrite is rejected by the authenticated receipt before
+        # the final chain/projection comparison. A timestamp rewrite reaches
+        # the latter comparison; both must leave the UoW fully rolled back.
+        expected_rejection = (
+            "authenticated StateChart receipt contradicts terminal projection"
+            if tamper == "state" else "trusted predecessor chain contradicts"
+        )
+        with pytest.raises(ValueError, match=expected_rejection):
             runtime.dispatch(Command(
                 command_id="cmd:after-public-projection-corruption",
                 name="allocate" if tamper == "state" else "start_pick",
