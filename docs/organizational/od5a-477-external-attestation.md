@@ -14,8 +14,10 @@ files** and an **out-of-band public-key fingerprint**.
   `openssl dgst -sha256 -sign /secure/private-key.pem -out /secure/statement.sig /secure/statement.json`
 - Independently derive the expected public-key fingerprint:
   `openssl pkey -pubin -in issuer-public.pem -outform DER | sha256sum`
-- Auditor verifies with its **preapproved** fingerprint, never a value taken from evidence:
-  `python -m scripts.verify_od5a_477_attestation od5a-477-evidence --issuer-id od5a:independent-operator --trusted-public-key /trusted/issuer-public.pem --expected-key-sha256 "$TRUSTED_SPKI_SHA256" --signature /secure/statement.sig`
+- Independently preregister the **approved source Git commit OID** (40 lowercase hex) and the **approved `uv.lock` SHA-256** (64 lowercase hex) in the auditor's controlled release manifest. Never derive these pins from the five-arm evidence or its signed statement: a valid signature alone does not prove that the signer used the approved code and dependencies.
+- Auditor verifies **all three independently provided pins**:
+  `python -m scripts.verify_od5a_477_attestation od5a-477-evidence --issuer-id od5a:independent-operator --trusted-public-key /trusted/issuer-public.pem --expected-key-sha256 "$TRUSTED_SPKI_SHA256" --expected-source-git-oid "$APPROVED_GIT_OID" --expected-uv-lock-sha256 "$APPROVED_UV_LOCK_SHA256" --signature /secure/statement.sig`
+- A missing, malformed or mismatched source/lock pin fails closed, even for a valid newly signed bundle. `auditor_provenance_pins_matched` indicates only that caller-supplied pins match independently rehashed raw evidence, **not** that the caller actually obtained them out-of-band.
 
 CI unit tests use disposable test keys only; they cannot stand in for a real
 independent issuer, nor can successful signature verification prove actual server
