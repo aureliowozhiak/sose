@@ -21,10 +21,11 @@ OWNER = "org:research-A"
 MODEL = "bounded-actor-model-hash"
 
 
-def _seed(store, *, owner=OWNER, key="actor-1"):
+def _seed(store, *, owner=OWNER, key="actor-1", tracked_time=False):
     return seed_actor(
         store, owner_id=owner, actor_key=key,
         model_spec_hash=MODEL, config_epoch=1, at=T0,
+        tracked_time=tracked_time,
     )
 
 
@@ -547,7 +548,7 @@ def test_actor_time_guard_rejects_forged_projection_before_next_transition(
     path = tmp_path / ("actor-conservation-" + mutation + ".sqlite")
     store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
     try:
-        actor_id = _seed(store)
+        actor_id = _seed(store, tracked_time=True)
         _transition(store, actor_id, "activate", 1)
         _transition(store, actor_id, "assign", 2, work_id="work:guard", cost_us=7)
         with store.transaction(owner_id=OWNER) as uow:
@@ -566,6 +567,20 @@ def test_actor_time_guard_rejects_forged_projection_before_next_transition(
                 attrs["assigned_work_id"] = "work:forged"
             elif mutation == "drop_causal_index":
                 attrs["applied_causes"].pop("observation:activate:1")
+            elif mutation == "admission_rewind":
+                actor.created_at = T0 - timedelta(seconds=1)
+                attrs["time_us"]["admitted"] += 1000000
+            elif mutation == "nonwork_cost_forgery":
+                from dataclasses import replace as dc_replace
+                command_id = deterministic_id(
+                    "od2-actor-command", OWNER, actor_id, "observation:activate:1",
+                )
+                command = uow.get_command(command_id)
+                uow.save_command(dc_replace(
+                    command, payload={**command.payload, "cost_us": 37},
+                ))
+                attrs["applied_causes"]["observation:activate:1"][3] = 37
+                attrs["paid_transition_us"] += 37
             uow.save_entity(actor)
         before_events = tuple(store.events())
         before_entity = store.entity(ACTOR_KIND, actor_id)
@@ -593,7 +608,7 @@ def test_actor_time_guard_keeps_legal_paid_state_conservation_and_restart(
     path = tmp_path / "actor-time-positive.sqlite"
     store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
     try:
-        actor_id = _seed(store, key="conserved")
+        actor_id = _seed(store, key="conserved", tracked_time=True)
         _transition(store, actor_id, "activate", 1, cost_us=3)
         _transition(store, actor_id, "assign", 2, work_id="work:legal", cost_us=7)
         _transition(store, actor_id, "complete", 3, work_id="work:legal", cost_us=5)
