@@ -5,6 +5,10 @@ Non-confirmatory bounded differential; NOT network-partition, fairness or DOE.
 from __future__ import annotations
 
 import os
+from hashlib import sha256
+import json
+from pathlib import Path
+import subprocess
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -49,6 +53,14 @@ def _physical_truth(store):
                 first, second,
             )
     return reservations
+
+
+def _sha(value):
+    """Canonical finite evidence digest; no claimed cryptographic issuer."""
+    return sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"),
+        default=str, allow_nan=False,
+    ).encode("utf-8")).hexdigest()
 
 
 def _source_truth(store, org):
@@ -106,6 +118,7 @@ def test_pg_native_and_reopened_physical_traces_match_sqlite_reducer_every_step(
                 shared_pool_binding=binding,
             )
     completed = False
+    trace = []
     with (
         SQLitePersistence(reference_path) as reference,
         PostgresPersistence(DSN, namespace=steady_ns) as steady,
@@ -130,8 +143,50 @@ def test_pg_native_and_reopened_physical_traces_match_sqlite_reducer_every_step(
                 assert restart_result.action == (
                     "advanced" if reference_advanced else "complete"
                 )
+                trace.append({
+                    "ordinal": tick,
+                    "action": restart_result.action,
+                    "reference_sha256": _sha(_source_truth(reference, org)),
+                    "native_pg_sha256": _sha(_source_truth(steady, org)),
+                    "reopened_pg_sha256": _sha(_source_truth(restarted, org)),
+                    "physical_pg_sha256": _sha(_physical_truth(steady)),
+                    "physical_reopened_sha256": _sha(_physical_truth(restarted)),
+                })
             if steady_result.action == "complete":
                 assert od5a_durable_state(reference, job_id=org)["done"]
                 completed = True
                 break
     assert completed, f"{arm_name} did not finish bounded 3-way PG native trace"
+
+    evidence_dir = os.environ.get("SOSE_OD5A_477_BUNDLE_DIR")
+    if evidence_dir:
+        root = Path(__file__).resolve().parents[4]
+        source_oid = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+        ).strip()
+        lock_digest = sha256((root / "uv.lock").read_bytes()).hexdigest()
+        result = {
+            "protocol": "sose-od5a-477-native-pg-recovery-evidence-v1",
+            "evidence_class": "NON_CONFIRMATORY",
+            "scientific_admission": "NOT_ADMITTED",
+            "arm": arm_name,
+            "git_source_oid": source_oid,
+            "uv_lock_sha256": lock_digest,
+            "model_spec_hash": arm.model.model_spec_hash,
+            "arm_admission_hash": arm.admission_hash,
+            "input_sha256": _sha({
+                "items": [(i.item_id, i.arrival_at, i.service_by_station) for i in items],
+                "binding": binding.fingerprint(),
+                "model": arm.model.model_spec_hash,
+                "admission": arm.admission_hash,
+            }),
+            "step_count": len(trace),
+            "fault_schedule": ["reopen_pg_connection_each_tick"],
+            "trace": trace,
+        }
+        target = Path(evidence_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / f"{arm_name}.json").write_text(
+            json.dumps(result, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )

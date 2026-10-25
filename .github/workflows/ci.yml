@@ -564,6 +564,7 @@ jobs:
       SOSE_PC6_FEDERATED_FAULT_MATRIX_REPORT: pc6-federated-fault-matrix.json
       SOSE_PC6_MULTIDOMAIN_OSKILL_REPORT: pc6-multidomain-oskill.json
       SOSE_PC6_REAL_MULTIDOMAIN_REPORT: pc6-real-multidomain.json
+      SOSE_OD5A_477_BUNDLE_DIR: od5a-477-evidence
 
     steps:
       - name: Checkout
@@ -613,6 +614,18 @@ jobs:
             tests/e2e/sose/persistence/test_postgres_owner_position_cas_interleaving.py \
             tests/e2e/sose/persistence/test_postgres_pc6_recurring_organization_recovery.py \
             tests/e2e/sose/persistence/test_postgres_pc6_recurring_causal_equivalence.py
+      - name: Verify five-arm OD-5a PG non-confirmatory recovery bundle
+        run: python scripts/verify_od5a_477_evidence.py od5a-477-evidence
+
+      - name: Preserve audited five-arm PG recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: od5a-477-physical-recovery-bundle
+          path: od5a-477-evidence/
+          retention-days: 30
+          if-no-files-found: warn
+
       - name: Certify OD-5a PostgreSQL physical observation and causal reconciliation
         run: |
           # Explicit live-database gate: the Python matrix skips these without
