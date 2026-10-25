@@ -6,6 +6,7 @@ equivalence, server/network failure certification, or full durable fairness.
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from multiprocessing import get_context
 from uuid import uuid4
 
@@ -143,9 +144,11 @@ def test_pg_three_os_workers_two_physical_instances_conserve_shared_capacity():
         ("org:pool2-b", "unit-2"),
         ("org:pool2-c", "unit-1"),
     )
+    seeded_sources = {}
     with PostgresPersistence(DSN, namespace=namespace) as seed:
         for org, instance in owners:
             _seed(seed, org, _binding(instance))
+            seeded_sources[org] = deepcopy(_source(seed, org))
 
     ctx = get_context("spawn")
     barrier = ctx.Barrier(3)
@@ -196,8 +199,9 @@ def test_pg_three_os_workers_two_physical_instances_conserve_shared_capacity():
         reservations = ledger.reservations()
         assert len(reservations) == 2
         assert {item.owner_id for item in reservations} == winners
-        assert {item.address.instance_id for item in reservations} == {
-            "unit-1", "unit-2",
+        assert {(item.owner_id, item.address.instance_id)
+                for item in reservations} == {
+            (org, instance) for org, instance in owners if org in winners
         }
         assert all(item.status == "reserved" for item in reservations)
         for org, instance in owners:
@@ -210,6 +214,9 @@ def test_pg_three_os_workers_two_physical_instances_conserve_shared_capacity():
                 assert any(e.owner_id == org for e in recovered.events())
             else:
                 assert org == loser and source["step"] == 0
+                assert source == seeded_sources[org], (
+                    "rejected writer mutated pending source or logical clock"
+                )
                 assert job.run_count == 0
                 assert job.active_trigger_id is not None
                 assert not any(e.owner_id == org for e in recovered.events())
