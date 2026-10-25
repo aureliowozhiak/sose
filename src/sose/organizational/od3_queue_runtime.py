@@ -107,7 +107,14 @@ def _verify_effect_cost_ledger(uow, queue: Entity, *, owner_id: str) -> None:
     This is consistency, not certified actor-time or physical service capacity.
     A public writer can still forge untrusted sources without #545 authority.
     """
-    effects = tuple(event for event in uow.events() if (
+    # Materialize one transaction-consistent snapshot and index event IDs
+    # once. Repeated uow.get_event() scans would make a long-lived queue's
+    # next policy observation O(N * E) within the business guard.
+    all_events = tuple(uow.events())
+    by_id = {}
+    for event in all_events:
+        by_id.setdefault(event.event_id, []).append(event)
+    effects = tuple(event for event in all_events if (
         event.name == "od3.queue_effect_applied"
         and event.entity_type == QUEUE_KIND and event.entity_id == queue.id
     ))
@@ -122,7 +129,8 @@ def _verify_effect_cost_ledger(uow, queue: Entity, *, owner_id: str) -> None:
     for ordinal, effect in enumerate(effects, start=1):
         evidence = effect.payload
         observation_id = evidence.get("observation_id")
-        decision = uow.get_event(effect.causation_id)
+        matches = by_id.get(effect.causation_id, ())
+        decision = matches[0] if len(matches) == 1 else None
         at = _utc(effect.occurred_at)
         cost = evidence.get("cost_us")
         if (
