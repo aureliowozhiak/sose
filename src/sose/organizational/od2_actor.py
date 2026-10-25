@@ -350,6 +350,104 @@ def _committed_work_event(
     )
 
 
+
+def _verify_actor_time_projection(uow, actor: OrganizationalActor) -> None:
+    """Reconstruct bounded actor-time from original committed Command/events.
+
+    This is a consistency/fail-closed control, NOT an independent source
+    authorization or physical-capacity grant. Legacy unverifiable histories
+    must be migrated through an independently authorized cutover, not guessed
+    from mutable attributes. No persisted record is modified by this audit.
+    """
+    meta = actor.attributes
+    if not isinstance(meta, dict) or not isinstance(meta.get("applied_causes"), dict):
+        raise ValueError("OD-2 actor-time ledger lacks durable cause index")
+    source_events = tuple(event for event in uow.events() if (
+        event.entity_type == ACTOR_KIND and event.entity_id == actor.id
+        and event.name == "entity.state_transition"
+    ))
+    if len(source_events) != len(meta["applied_causes"]):
+        raise ValueError("OD-2 actor-time causal history incomplete or duplicated")
+    amounts = {state: 0 for state in ACTOR_STATES}
+    paid_us = 0
+    current_state = "admitted"
+    last_at = _utc(actor.created_at)
+    assigned_work = None
+    seen_causes = set()
+    for source in source_events:
+        command = uow.get_command(source.causation_id)
+        if command is None or not isinstance(command.payload, dict):
+            raise ValueError("OD-2 actor-time missing original causal Command")
+        payload = command.payload
+        cause = payload.get("external_cause_id")
+        work_id = payload.get("work_id")
+        cost = payload.get("cost_us")
+        event_at = _utc(source.occurred_at)
+        if (
+            not isinstance(cause, str) or not cause.strip() or cause in seen_causes
+            or command.command_id != deterministic_id(
+                "od2-actor-command", source.owner_id, actor.id, cause
+            )
+            or command.owner_id != meta.get("owner_id")
+            or source.owner_id != command.owner_id
+            or command.entity_type != ACTOR_KIND or command.entity_id != actor.id
+            or command.name != source.payload.get("trigger")
+            or command.due_at != event_at or command.issued_at != event_at
+            or source.correlation_id != command.correlation_id
+            or payload.get("evidence_version") != 1
+            or payload.get("model_spec_hash") != meta.get("model_spec_hash")
+            or payload.get("config_epoch") != meta.get("config_epoch")
+            or type(cost) is not int or cost < 0
+            or source.payload.get("from_state") != current_state
+            or source.payload.get("to_state") not in ACTOR_STATES
+            or event_at < last_at
+        ):
+            raise ValueError("OD-2 actor-time causal lineage contradicts original history")
+        action = command.name
+        if action == "assign":
+            if assigned_work is not None or not isinstance(work_id, str) or not work_id.strip():
+                raise ValueError("OD-2 actor-time duplicate or unidentifiable assignment")
+            assigned_work = work_id
+        elif action == "complete":
+            if assigned_work is None or assigned_work != work_id:
+                raise ValueError("OD-2 actor-time completion does not match assignment")
+            assigned_work = None
+        elif work_id is not None:
+            raise ValueError("OD-2 actor-time work ID on non-work transition")
+        if action in ("assign", "complete"):
+            expected = _committed_work_event(
+                command=command, actor_id=actor.id, cause_id=cause,
+                source=source, model_spec_hash=meta["model_spec_hash"],
+                config_epoch=meta["config_epoch"], work_id=work_id,
+                cost_us=cost,
+            )
+            evidence = tuple(event for event in uow.events() if (
+                event.event_id == expected.event_id
+            ))
+            if len(evidence) != 1 or evidence[0] != expected:
+                raise ValueError("OD-2 actor-time work/cost evidence missing or modified")
+        expected_cause = [
+            action, event_at.isoformat(), work_id, cost,
+        ]
+        if meta["applied_causes"].get(cause) != expected_cause:
+            raise ValueError("OD-2 actor-time projection contradicts causal history")
+        amounts[current_state] += (event_at - last_at) // timedelta(microseconds=1)
+        paid_us += cost
+        last_at = event_at
+        current_state = source.payload["to_state"]
+        seen_causes.add(cause)
+    if (
+        set(meta["applied_causes"]) != seen_causes
+        or meta.get("time_us") != amounts
+        or type(meta.get("paid_transition_us")) is not int
+        or meta["paid_transition_us"] != paid_us
+        or meta.get("last_at") != last_at.isoformat()
+        or actor.state != current_state
+        or meta.get("assigned_work_id") != assigned_work
+    ):
+        raise ValueError("OD-2 actor-time projection contradicts committed time/cost ledger")
+
+
 def transition_actor(
     store: Persistence, *, owner_id: str, actor_id: str,
     action: str, cause_id: str, at: datetime,
@@ -408,6 +506,7 @@ def transition_actor(
             _require_actor_calendar_start(
                 uow, actor, now, require_window=False,
             )
+            _verify_actor_time_projection(uow, actor)
             used = meta["applied_causes"].get(cause_id)
             if used is not None:
                 if used != list(identity):
