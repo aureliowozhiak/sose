@@ -291,9 +291,9 @@ def apply_od3_queue_policy(
                     raise ValueError("OD-3 queue observation lacks durable effect evidence")
                 return event
 
-            _verify_effect_cost_ledger(uow, queue, owner_id=owner_id)
             if queue.created_at is None or now < _utc(queue.created_at):
                 raise ValueError("OD-3 observation precedes queue admission")
+            _verify_effect_cost_ledger(uow, queue, owner_id=owner_id)
             previous_observed = queue.attributes["last_observed_at"]
             if previous_observed is not None and now < _utc(datetime.fromisoformat(previous_observed)):
                 raise ValueError("OD-3 queue observation time regressed")
