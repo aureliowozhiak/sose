@@ -73,14 +73,26 @@ def public_key_fingerprint(public_key: Path) -> str:
 def verify_attestation(
     root: Path, *, issuer_id: str, trusted_public_key: Path,
     expected_key_sha256: str, signature_path: Path,
+    expected_source_git_oid: str, expected_uv_lock_sha256: str,
 ) -> dict:
     """Fail closed; never import a signer key or fingerprint from evidence."""
     if not isinstance(expected_key_sha256, str) or not _HEX64.fullmatch(expected_key_sha256):
         raise ValueError("independently pinned 64-digit key SHA-256 is mandatory")
+    if not isinstance(expected_source_git_oid, str) or re.fullmatch(r"[0-9a-f]{40}", expected_source_git_oid) is None:
+        raise ValueError("independently pinned source Git OID required")
+    if not isinstance(expected_uv_lock_sha256, str) or _HEX64.fullmatch(expected_uv_lock_sha256) is None:
+        raise ValueError("independently pinned uv.lock SHA-256 required")
     trusted_der, actual_fingerprint = _trusted_key_snapshot(trusted_public_key)
     if actual_fingerprint != expected_key_sha256:
         raise ValueError("external trust root fingerprint mismatch")
     content = statement(root, issuer_id=issuer_id)
+    claims = json.loads(content)
+    # Both pins are provided by the auditor; do not infer them from the bundle
+    # or from the signature. A valid signature can cover the wrong source.
+    if claims["source_git_oid"] != expected_source_git_oid:
+        raise ValueError("independently pinned source Git OID mismatch")
+    if claims["uv_lock_sha256"] != expected_uv_lock_sha256:
+        raise ValueError("independently pinned uv.lock SHA-256 mismatch")
     try:
         signature_bytes = signature_path.read_bytes()
     except OSError as exc:
@@ -116,6 +128,9 @@ def verify_attestation(
         "issuer_id": issuer_id,
         "issuer_public_key_sha256": actual_fingerprint,
         "statement_sha256": sha256(content).hexdigest(),
+        "auditor_provenance_pins_matched": True,
+        "source_git_oid": expected_source_git_oid,
+        "uv_lock_sha256": expected_uv_lock_sha256,
         "evidence_class": "NON_CONFIRMATORY",
         "scientific_admission": "NOT_ADMITTED",
         # This is AUTHENTICITY of one bounded bundle, not proof that all #477
@@ -133,17 +148,23 @@ def main() -> int:
     actions.add_argument("--signature", type=Path)
     parser.add_argument("--trusted-public-key", type=Path)
     parser.add_argument("--expected-key-sha256")
+    parser.add_argument("--expected-source-git-oid")
+    parser.add_argument("--expected-uv-lock-sha256")
     args = parser.parse_args()
     if args.emit_statement is not None:
         args.emit_statement.write_bytes(statement(args.bundle, issuer_id=args.issuer_id))
         return 0
     if args.trusted_public_key is None or args.expected_key_sha256 is None:
         parser.error("verification requires external public key AND pinned fingerprint")
+    if args.expected_source_git_oid is None or args.expected_uv_lock_sha256 is None:
+        parser.error("verification requires source Git OID and uv.lock SHA-256 pins")
     result = verify_attestation(
         args.bundle, issuer_id=args.issuer_id,
         trusted_public_key=args.trusted_public_key,
         expected_key_sha256=args.expected_key_sha256,
         signature_path=args.signature,
+        expected_source_git_oid=args.expected_source_git_oid,
+        expected_uv_lock_sha256=args.expected_uv_lock_sha256,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
