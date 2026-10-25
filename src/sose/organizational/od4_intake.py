@@ -162,6 +162,28 @@ def _verify_decision_ledger(uow, work: ManagementWork,
         command_id = deterministic_id("od4-command-v1", owner_id, work.id, cause)
         action = payload.get("action")
         observed = _utc(decision.occurred_at)
+        # Re-check the ORIGINAL causal Command on every new intervention,
+        # not just when replaying a prior request. Otherwise a public writer
+        # may rewrite its paid management cause after the first decision.
+        command = uow.get_command(command_id)
+        if (
+            command is None
+            or command.command_id != command_id
+            or command.owner_id != owner_id
+            or command.entity_type != WORK_KIND or command.entity_id != work.id
+            or command.name != action
+            or command.due_at != observed or command.issued_at != observed
+            or command.causation_id is not None
+            or command.correlation_id != decision.correlation_id
+            or not isinstance(command.payload, dict)
+            or command.payload.get("cause_id") != cause
+            or command.payload.get("protocol") != protocol.snapshot()
+            or command.payload.get("request") != [
+                action, payload.get("matched_action"),
+                observed.isoformat(), protocol.snapshot(),
+            ]
+        ):
+            raise ValueError("OD-4 durable management original Command inconsistent")
         next_state = (
             {"accept": "accepted", "reject": "rejected"}.get(action)
             if action != "sham" else effective_state
