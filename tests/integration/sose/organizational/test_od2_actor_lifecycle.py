@@ -529,3 +529,88 @@ def test_od2_nested_uow_cannot_claim_predecessor_replacement(adapter, tmp_path):
     finally:
         if adapter == "sqlite":
             store.close()
+
+
+@pytest.mark.parametrize("adapter", ["memory", "sqlite"])
+@pytest.mark.parametrize("mutation", [
+    "reclassify_elapsed", "inflate_elapsed", "paid_cost",
+    "last_at", "assigned_work", "drop_causal_index",
+])
+def test_actor_time_guard_rejects_forged_projection_before_next_transition(
+    adapter, mutation, tmp_path,
+):
+    """#462: each source interval and charged decision must reconcile on read.
+
+    Even a state-bucket transfer preserving TOTAL elapsed cannot be accepted
+    from mutable Entity attributes in place of original Command/events.
+    """
+    path = tmp_path / ("actor-conservation-" + mutation + ".sqlite")
+    store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
+    try:
+        actor_id = _seed(store)
+        _transition(store, actor_id, "activate", 1)
+        _transition(store, actor_id, "assign", 2, work_id="work:guard", cost_us=7)
+        with store.transaction(owner_id=OWNER) as uow:
+            actor = uow.get_entity(ACTOR_KIND, actor_id)
+            attrs = actor.attributes
+            if mutation == "reclassify_elapsed":
+                attrs["time_us"]["eligible"] -= 1
+                attrs["time_us"]["active"] += 1
+            elif mutation == "inflate_elapsed":
+                attrs["time_us"]["active"] += 100
+            elif mutation == "paid_cost":
+                attrs["paid_transition_us"] = 0
+            elif mutation == "last_at":
+                attrs["last_at"] = (T0 + timedelta(hours=2, seconds=1)).isoformat()
+            elif mutation == "assigned_work":
+                attrs["assigned_work_id"] = "work:forged"
+            elif mutation == "drop_causal_index":
+                attrs["applied_causes"].pop("observation:activate:1")
+            uow.save_entity(actor)
+        before_events = tuple(store.events())
+        before_entity = store.entity(ACTOR_KIND, actor_id)
+        before_commands = tuple(
+            (event.causation_id, store.command(event.causation_id))
+            for event in before_events if event.name == "entity.state_transition"
+        )
+        with pytest.raises(ValueError, match="OD-2 actor-time"):
+            _transition(
+                store, actor_id, "complete", 3, work_id="work:guard",
+            )
+        assert tuple(store.events()) == before_events
+        assert store.entity(ACTOR_KIND, actor_id) == before_entity
+        assert all(store.command(key) == command for key, command in before_commands)
+    finally:
+        if adapter == "sqlite":
+            store.close()
+
+
+@pytest.mark.parametrize("adapter", ["memory", "sqlite"])
+def test_actor_time_guard_keeps_legal_paid_state_conservation_and_restart(
+    adapter, tmp_path,
+):
+    """Positive control: compensated work, development and clean restart."""
+    path = tmp_path / "actor-time-positive.sqlite"
+    store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
+    try:
+        actor_id = _seed(store, key="conserved")
+        _transition(store, actor_id, "activate", 1, cost_us=3)
+        _transition(store, actor_id, "assign", 2, work_id="work:legal", cost_us=7)
+        _transition(store, actor_id, "complete", 3, work_id="work:legal", cost_us=5)
+        _transition(store, actor_id, "begin_development", 4, cost_us=11)
+        _transition(store, actor_id, "finish_development", 6, cost_us=2)
+        result = _transition(store, actor_id, "exit", 7, cost_us=1)
+        assert result.state == "exited"
+        assert result.attributes["paid_transition_us"] == 29
+        assert sum(result.attributes["time_us"].values()) == 7 * 3600 * 1000000
+        assert result.attributes["time_us"]["development"] == 2 * 3600 * 1000000
+        assert result.attributes["assigned_work_id"] is None
+        assert len([e for e in store.events() if e.name == "entity.state_transition"
+                    and e.entity_id == actor_id]) == 6
+        assert _transition(store, actor_id, "exit", 7, cost_us=1) == result
+    finally:
+        if adapter == "sqlite":
+            store.close()
+    if adapter == "sqlite":
+        with SQLitePersistence(path) as reopened:
+            assert _transition(reopened, actor_id, "exit", 7, cost_us=1) == result
