@@ -77,6 +77,6 @@ def test_corrupt_bundle_cannot_pass_gate(tmp_path, corrupt, reason):
 
 def test_missing_arm_fails_closed(tmp_path):
     _bundle(tmp_path)
-    (tmp_path / "mro.json").unlink()
+    (tmp_path / "baseline.json").unlink()
     with pytest.raises(ValueError, match="incomplete"):
         verify(tmp_path)
