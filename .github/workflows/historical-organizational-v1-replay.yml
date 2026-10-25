@@ -5,6 +5,7 @@ on:
     paths:
       - "src/sose/**"
       - "tests/e2e/sose/persistence/test_postgres_pc6_multiflow_equivalence.py"
+      - "tests/e2e/sose/persistence/test_postgres_od5a_*.py"
       - ".github/workflows/ci.yml"
       - "scripts/**"
       - "uv.lock"
@@ -20,6 +21,7 @@ on:
     paths:
       - "src/sose/**"
       - "tests/e2e/sose/persistence/test_postgres_pc6_multiflow_equivalence.py"
+      - "tests/e2e/sose/persistence/test_postgres_od5a_*.py"
       - ".github/workflows/ci.yml"
       - "scripts/**"
       - "uv.lock"
