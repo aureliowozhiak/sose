@@ -126,6 +126,60 @@ class TransitionAuthority:
             payload={**claims, "signature": signature},
         )
 
+    def validate_prestate(self, *, uow, before: Entity, chart) -> None:
+        """Reject public-UoW predecessor laundering before any native send.
+
+        A real signed successor is not trustworthy if its starting projection
+        was fabricated. This is a bounded, opt-in *local* chain-of-custody
+        check, NOT a durable PostgreSQL owner-epoch or writer-role fence.
+        """
+        if type(before.version) is not int or before.version < 0:
+            raise ValueError("unauthenticated prestate: invalid entity version")
+
+        history = tuple(
+            event for event in uow.events()
+            if event.entity_type == before.entity_type
+            and event.entity_id == before.id
+            and event.name == "entity.state_transition"
+        )
+        if before.version == 0:
+            initial = {
+                str(state.id) for state in chart.states
+                if getattr(state, "initial", False)
+            }
+            if not initial or before.state not in initial or history:
+                raise ValueError(
+                    "unauthenticated prestate: version-zero entity must be "
+                    "at a declared initial StateChart state without prior events"
+                )
+            return
+
+        # There can be no unsigned jump directly to packed/eligible. If this
+        # entity was ever advanced, its latest predecessor must be a native
+        # Engine-signed transition for this exact owner, version and state.
+        previous = history
+        candidates = []
+        seen_later = False
+        for event in previous:
+            receipt = uow.get_event(self._record_id(event.event_id))
+            if receipt is None or receipt.name != ATTESTATION_EVENT:
+                continue
+            claim = receipt.payload
+            if type(claim.get("to_version")) is int:
+                if claim["to_version"] > before.version:
+                    seen_later = True
+                if (
+                    claim["to_version"] == before.version
+                    and claim.get("to_state") == before.state
+                    and claim.get("owner_id") == event.owner_id
+                ):
+                    candidates.append(event)
+        if seen_later or len(candidates) != 1:
+            raise ValueError("trusted predecessor missing or entity version rewound")
+        # Cryptographic source validation and current committed projection
+        # checks must succeed before it is used as a predecessor.
+        self.verify(uow=uow, event=candidates[0])
+
     def verify(self, *, uow, event: DomainEvent) -> DomainEvent:
         """Verify bound issuer, source event and MAC; fail closed on replay."""
         source_matches = [x for x in uow.events() if x.event_id == event.event_id]
