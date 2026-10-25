@@ -536,6 +536,7 @@ def test_od2_nested_uow_cannot_claim_predecessor_replacement(adapter, tmp_path):
 @pytest.mark.parametrize("mutation", [
     "reclassify_elapsed", "inflate_elapsed", "paid_cost",
     "last_at", "assigned_work", "drop_causal_index",
+    "admission_rewind", "nonwork_cost_forgery", "paid_to_zero",
 ])
 def test_actor_time_guard_rejects_forged_projection_before_next_transition(
     adapter, mutation, tmp_path,
@@ -549,7 +550,10 @@ def test_actor_time_guard_rejects_forged_projection_before_next_transition(
     store = MemoryPersistence() if adapter == "memory" else SQLitePersistence(path)
     try:
         actor_id = _seed(store, tracked_time=True)
-        _transition(store, actor_id, "activate", 1)
+        # The paid-to-zero mutant must start with a genuinely charged
+        # non-work transition, not an already zero-cost activate.
+        initial_cost = 9 if mutation == "paid_to_zero" else 0
+        _transition(store, actor_id, "activate", 1, cost_us=initial_cost)
         _transition(store, actor_id, "assign", 2, work_id="work:guard", cost_us=7)
         with store.transaction(owner_id=OWNER) as uow:
             actor = uow.get_entity(ACTOR_KIND, actor_id)
@@ -570,17 +574,23 @@ def test_actor_time_guard_rejects_forged_projection_before_next_transition(
             elif mutation == "admission_rewind":
                 actor.created_at = T0 - timedelta(seconds=1)
                 attrs["time_us"]["admitted"] += 1000000
-            elif mutation == "nonwork_cost_forgery":
+            elif mutation in ("nonwork_cost_forgery", "paid_to_zero"):
                 from dataclasses import replace as dc_replace
                 command_id = deterministic_id(
                     "od2-actor-command", OWNER, actor_id, "observation:activate:1",
                 )
                 command = uow.get_command(command_id)
+                assert command is not None
+                assert command.payload["cost_us"] == initial_cost
+                # Coordinated rewriting of *both* persisted Command and
+                # mutable projection cannot override the original cost event.
+                forged_cost = 0 if mutation == "paid_to_zero" else 37
                 uow.save_command(dc_replace(
-                    command, payload={**command.payload, "cost_us": 37},
+                    command,
+                    payload={**command.payload, "cost_us": forged_cost},
                 ))
-                attrs["applied_causes"]["observation:activate:1"][3] = 37
-                attrs["paid_transition_us"] += 37
+                attrs["applied_causes"]["observation:activate:1"][3] = forged_cost
+                attrs["paid_transition_us"] += forged_cost - initial_cost
             uow.save_entity(actor)
         before_events = tuple(store.events())
         before_entity = store.entity(ACTOR_KIND, actor_id)
