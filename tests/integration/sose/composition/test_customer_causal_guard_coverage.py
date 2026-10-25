@@ -14,8 +14,6 @@ from types import SimpleNamespace
 import pytest
 
 from sose.composition import trading_company_customer as customer
-from sose.core.events import Command
-from sose.core.identity import deterministic_id
 from sose.persistence.memory import MemoryPersistence
 
 
@@ -254,7 +252,7 @@ def test_pickup_resolves_only_matching_scheduled_causal_work(
         ("", None, None),
         (" ", None, None),
         (None, None, None),
-        (OWNER, MemoryPersistence(), None),
+        (OWNER, "injected_store", None),
         (OWNER, None, ""),
         (OWNER, None, 42),
     ],
@@ -265,7 +263,7 @@ def test_customer_runner_rejects_unbound_identity_before_creating_state(
     with pytest.raises(ValueError, match="organization_id|instance_key"):
         customer.run_customer_demand_path(
             organization_id=owner,
-            persistence=persistence,
+            persistence=(MemoryPersistence() if persistence == "injected_store" else None),
             instance_key=instance,
         )
 
