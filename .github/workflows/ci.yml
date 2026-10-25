@@ -614,6 +614,13 @@ jobs:
             tests/e2e/sose/persistence/test_postgres_owner_position_cas_interleaving.py \
             tests/e2e/sose/persistence/test_postgres_pc6_recurring_organization_recovery.py \
             tests/e2e/sose/persistence/test_postgres_pc6_recurring_causal_equivalence.py
+      - name: Certify real isolated PostgreSQL postmaster SIGKILL/restart
+        env:
+          SOSE_RUN_PG_SERVER_RESTART: "1"
+        run: |
+          docker info >/dev/null
+          python -m pytest -q -rs tests/e2e/sose/persistence/test_postgres_od5a_real_server_restart.py
+
       - name: Verify five-arm OD-5a PG non-confirmatory recovery bundle
         run: python scripts/verify_od5a_477_evidence.py od5a-477-evidence
 
