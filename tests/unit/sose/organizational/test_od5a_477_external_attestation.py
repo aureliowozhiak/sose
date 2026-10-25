@@ -97,3 +97,54 @@ def test_no_scientific_promotion_by_attestation(signed_bundle):
     (root / "baseline.json").write_text(json.dumps(record))
     with pytest.raises(ValueError, match="provenance"):
         _verify(signed_bundle)
+
+
+def test_replaced_public_key_after_fingerprint_cannot_bypass_external_pin(
+    signed_bundle, tmp_path, monkeypatch,
+):
+    """P1: key path replacement between pinning and signature check fails shut.
+
+    The attacker substitutes a different public key and its own valid detached
+    signature while preserving the independently approved legitimate key hash.
+    Reopening the same mutable pathname at verification would incorrectly pass.
+    """
+    from scripts import verify_od5a_477_attestation as attestation
+
+    root, trusted_key, signature_path, trusted_fingerprint = signed_bundle
+    forged_private = tmp_path / "untrusted-private.pem"
+    forged_public = tmp_path / "untrusted-public.pem"
+    subprocess.run(
+        ["openssl", "genpkey", "-algorithm", "RSA",
+         "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(forged_private)],
+        capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["openssl", "pkey", "-in", str(forged_private),
+         "-pubout", "-out", str(forged_public)],
+        capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", str(forged_private),
+         "-out", str(signature_path)],
+        input=statement(root, issuer_id=ISSUER),
+        capture_output=True, check=True,
+    )
+
+    original_statement = attestation.statement
+    switched = {"done": False}
+
+    def replace_key_mid_verification(*args, **kwargs):
+        output = original_statement(*args, **kwargs)
+        trusted_key.write_bytes(forged_public.read_bytes())
+        switched["done"] = True
+        return output
+
+    monkeypatch.setattr(attestation, "statement", replace_key_mid_verification)
+    with pytest.raises(ValueError, match="external detached signature invalid"):
+        attestation.verify_attestation(
+            root, issuer_id=ISSUER, trusted_public_key=trusted_key,
+            expected_key_sha256=trusted_fingerprint,
+            signature_path=signature_path,
+        )
+    assert switched["done"]
+    assert attestation.public_key_fingerprint(trusted_key) != trusted_fingerprint

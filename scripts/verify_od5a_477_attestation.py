@@ -10,6 +10,7 @@ import argparse
 import json
 import re
 import subprocess
+from tempfile import TemporaryDirectory
 from hashlib import sha256
 from pathlib import Path
 
@@ -44,18 +45,29 @@ def statement(root: Path, *, issuer_id: str) -> bytes:
     })
 
 
-def public_key_fingerprint(public_key: Path) -> str:
-    """SHA-256 over DER SubjectPublicKeyInfo, not variable PEM whitespace."""
+def _trusted_key_snapshot(public_key: Path) -> tuple[bytes, str]:
+    """Canonical SPKI and fingerprint derived from ONE public-key byte snapshot.
+
+    Never fingerprint a path and then let a verifier reopen that path:
+    a symlink-target or file replacement between the two would bypass the pin.
+    """
     try:
+        original = public_key.read_bytes()
         result = subprocess.run(
-            ["openssl", "pkey", "-pubin", "-in", str(public_key), "-outform", "DER"],
-            check=True, capture_output=True,
+            ["openssl", "pkey", "-pubin", "-outform", "DER"],
+            input=original, check=True, capture_output=True,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+    except (OSError, subprocess.CalledProcessError) as exc:
         raise ValueError("trusted public key or OpenSSL cannot be loaded") from exc
     if not result.stdout:
         raise ValueError("trusted public key has no SubjectPublicKeyInfo")
-    return sha256(result.stdout).hexdigest()
+    der = result.stdout
+    return der, sha256(der).hexdigest()
+
+
+def public_key_fingerprint(public_key: Path) -> str:
+    """SHA-256 over DER SubjectPublicKeyInfo from a single immutable read."""
+    return _trusted_key_snapshot(public_key)[1]
 
 
 def verify_attestation(
@@ -65,19 +77,36 @@ def verify_attestation(
     """Fail closed; never import a signer key or fingerprint from evidence."""
     if not isinstance(expected_key_sha256, str) or not _HEX64.fullmatch(expected_key_sha256):
         raise ValueError("independently pinned 64-digit key SHA-256 is mandatory")
-    actual_fingerprint = public_key_fingerprint(trusted_public_key)
+    trusted_der, actual_fingerprint = _trusted_key_snapshot(trusted_public_key)
     if actual_fingerprint != expected_key_sha256:
         raise ValueError("external trust root fingerprint mismatch")
     content = statement(root, issuer_id=issuer_id)
-    if not signature_path.is_file() or not signature_path.read_bytes():
+    try:
+        signature_bytes = signature_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("external detached signature missing or empty") from exc
+    if not signature_bytes:
         raise ValueError("external detached signature missing or empty")
     try:
-        checked = subprocess.run(
-            ["openssl", "dgst", "-sha256", "-verify", str(trusted_public_key),
-             "-signature", str(signature_path)],
-            input=content, capture_output=True, check=False,
-        )
-    except FileNotFoundError as exc:
+        # Normalize the SAME pinned SPKI bytes; never re-read the user-supplied
+        # public-key path during openssl dgst verification.
+        normalized = subprocess.run(
+            ["openssl", "pkey", "-pubin", "-inform", "DER", "-outform", "PEM"],
+            input=trusted_der, check=True, capture_output=True,
+        ).stdout
+        if not normalized:
+            raise ValueError("pinned trusted public key normalization failed")
+        with TemporaryDirectory(prefix="sose-477-trusted-snapshot-") as temp:
+            key_file = Path(temp) / "verified-public.pem"
+            signature_file = Path(temp) / "signature.bin"
+            key_file.write_bytes(normalized)
+            signature_file.write_bytes(signature_bytes)
+            checked = subprocess.run(
+                ["openssl", "dgst", "-sha256", "-verify", str(key_file),
+                 "-signature", str(signature_file)],
+                input=content, capture_output=True, check=False,
+            )
+    except (OSError, subprocess.CalledProcessError) as exc:
         raise ValueError("OpenSSL signature verifier unavailable") from exc
     if checked.returncode != 0 or b"Verified OK" not in checked.stdout:
         raise ValueError("external detached signature invalid for current bundle")
