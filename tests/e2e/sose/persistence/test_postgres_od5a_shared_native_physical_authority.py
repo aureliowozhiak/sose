@@ -1021,3 +1021,74 @@ def test_pg_uncertain_successful_commit_replays_native_physical_effect_once(monk
         assert ledger.reservations() == before_bookings
         assert ledger.audit()
 
+
+
+def test_pg_failure_after_real_physical_reservation_rolls_back_source_and_pool(
+    monkeypatch,
+):
+    """#477: failed post-reserve/pre-COMMIT source must not ghost-book capacity.
+
+    The fault occurs AFTER the real PostgreSQL temporal ledger has inserted the
+    physical booking, inside the same owner-fenced SQL transaction that would
+    advance source/events/job. This is not a mocked reserve failure, a network
+    kill, or the already covered *post*-COMMIT lost response.
+    """
+    assert DSN
+    namespace = _namespace()
+    binding = _binding("unit-1")
+    aborted_org, independent_org = "org:aborted-grant", "org:subsequent-peer"
+    original_apply = SharedPhysicalGrantAuthority.apply
+    injected = {"saw_physical_booking": False}
+
+    def reserve_then_abort(self, *, before, releases, grants, after_state, at, uow):
+        original_apply(
+            self, before=before, releases=releases, grants=grants,
+            after_state=after_state, at=at, uow=uow,
+        )
+        assert self.owner_id == aborted_org
+        assert len(grants) == 1
+        # This assertion executes before the owner UoW COMMIT. A fake grant,
+        # no-op test double or injection before ledger.reserve cannot pass.
+        bookings = self.ledger.reservations()
+        assert len(bookings) == 1
+        assert bookings[0].owner_id == aborted_org
+        assert bookings[0].status == "reserved"
+        injected["saw_physical_booking"] = True
+        raise RuntimeError("injected: post-reserve pre-commit abort")
+
+    with PostgresPersistence(DSN, namespace=namespace) as store:
+        _seed(store, aborted_org, binding)
+        _seed(store, independent_org, binding)
+        monkeypatch.setattr(
+            SharedPhysicalGrantAuthority, "apply", reserve_then_abort,
+        )
+        with pytest.raises(RuntimeError, match="post-reserve pre-commit abort"):
+            _tick(store, aborted_org, binding)
+        assert injected["saw_physical_booking"]
+
+        # PostgreSQL must have rolled back BOTH the native source and the
+        # real temporal booking. A ghost booking would block this peer.
+        monkeypatch.setattr(
+            SharedPhysicalGrantAuthority, "apply", original_apply,
+        )
+        assert store.temporal_resources().reservations() == ()
+        assert _source(store, aborted_org)["step"] == 0
+        assert store.job_state(aborted_org).run_count == 0
+        assert not any(e.owner_id == aborted_org for e in store.events())
+        assert store.temporal_resources().audit()
+        assert _tick(store, independent_org, binding).action == "advanced"
+        assert _source(store, independent_org)["step"] == 1
+        assert _source(store, aborted_org)["step"] == 0
+
+    # Verify persisted truth using an independent PostgreSQL connection.
+    with PostgresPersistence(DSN, namespace=namespace) as recovered:
+        bookings = recovered.temporal_resources().reservations()
+        assert len(bookings) == 1
+        assert bookings[0].owner_id == independent_org
+        assert bookings[0].address.instance_id == "unit-1"
+        assert bookings[0].start_at == _ORIGIN
+        assert bookings[0].end_at == _ORIGIN + timedelta(seconds=0.2)
+        assert recovered.job_state(independent_org).run_count == 1
+        assert recovered.job_state(aborted_org).run_count == 0
+        assert not any(e.owner_id == aborted_org for e in recovered.events())
+        assert recovered.temporal_resources().audit()
