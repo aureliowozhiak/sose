@@ -228,14 +228,17 @@ def seed_actor(
     model_spec_hash: str, config_epoch: int, at: datetime,
     replaces_actor_id: str | None = None,
     availability_calendar: ActorAvailabilityCalendar | None = None,
+    tracked_time: bool = False,
 ) -> str:
-    """Enroll an independent actor; optional replacement requires exited peer."""
+    """Enroll an actor; optional v1 original-time evidence is prospective only."""
     _identity(owner_id, "owner_id")
     _identity(actor_key, "actor_key")
     _identity(model_spec_hash, "model_spec_hash")
     if type(config_epoch) is not int or config_epoch < 0:
         raise ValueError("config_epoch must be a nonnegative integer")
     now = _utc(at)
+    if type(tracked_time) is not bool:
+        raise TypeError("tracked_time must be an explicit boolean")
     if availability_calendar is not None:
         if not isinstance(availability_calendar, ActorAvailabilityCalendar):
             raise TypeError("availability_calendar must be ActorAvailabilityCalendar")
@@ -290,6 +293,7 @@ def seed_actor(
                     "assigned_work_id": None, "applied_causes": {},
                     "replaces_actor_id": replaces_actor_id,
                     "replaced_by_actor_id": None,
+                    **({"tracked_time_version": 1} if tracked_time else {}),
                     **({
                         "availability_calendar": {
                             **availability_calendar.snapshot(),
@@ -315,7 +319,26 @@ def seed_actor(
                         "model_spec_hash": model_spec_hash,
                     },
                 ))
+            if tracked_time:
+                uow.append_event(DomainEvent(
+                    event_id=_actor_time_origin_event_id(identity),
+                    name="od2.actor_time_origin_recorded",
+                    entity_type=ACTOR_KIND, entity_id=identity,
+                    owner_id=owner_id, occurred_at=now,
+                    correlation_id=deterministic_id("od2-actor-flow", owner_id, identity),
+                    payload={
+                        "owner_id": owner_id,
+                        "model_spec_hash": model_spec_hash,
+                        "config_epoch": config_epoch,
+                        "replaces_actor_id": replaces_actor_id,
+                        "tracked_time_version": 1,
+                    },
+                ))
     return identity
+
+
+def _actor_time_origin_event_id(actor_id: str) -> str:
+    return deterministic_id("od2-actor-time-origin-v1", actor_id)
 
 
 def _committed_work_event(
@@ -351,6 +374,32 @@ def _committed_work_event(
 
 
 
+
+def _committed_nonwork_cost_event(
+    *, command: Command, actor_id: str, cause_id: str,
+    source: DomainEvent, model_spec_hash: str, config_epoch: int,
+    cost_us: int,
+) -> DomainEvent:
+    """Versioned immutable non-work cost ledger entry in the source UoW."""
+    return DomainEvent(
+        event_id=deterministic_id(
+            "od2-nonwork-cost-v1", command.owner_id, actor_id, cause_id,
+        ),
+        name="od2.actor_nonwork_cost_caused",
+        entity_type="organizational_actor_paid_transition",
+        entity_id=command.command_id, owner_id=command.owner_id,
+        occurred_at=source.occurred_at,
+        causation_id=source.event_id, correlation_id=command.correlation_id,
+        payload={
+            "actor_id": actor_id, "command_id": command.command_id,
+            "source_event_id": source.event_id, "action": command.name,
+            "external_cause_id": cause_id,
+            "cost_us": cost_us, "model_spec_hash": model_spec_hash,
+            "config_epoch": config_epoch,
+        },
+    )
+
+
 def _verify_actor_time_projection(uow, actor: OrganizationalActor) -> None:
     """Reconstruct bounded actor-time from original committed Command/events.
 
@@ -371,7 +420,24 @@ def _verify_actor_time_projection(uow, actor: OrganizationalActor) -> None:
     amounts = {state: 0 for state in ACTOR_STATES}
     paid_us = 0
     current_state = "admitted"
-    last_at = _utc(actor.created_at)
+    origin = uow.get_event(_actor_time_origin_event_id(actor.id))
+    if (
+        origin is None
+        or origin.name != "od2.actor_time_origin_recorded"
+        or origin.entity_type != ACTOR_KIND or origin.entity_id != actor.id
+        or origin.owner_id != meta.get("owner_id")
+        or origin.payload != {
+            "owner_id": meta.get("owner_id"),
+            "model_spec_hash": meta.get("model_spec_hash"),
+            "config_epoch": meta.get("config_epoch"),
+            "replaces_actor_id": meta.get("replaces_actor_id"),
+            "tracked_time_version": 1,
+        }
+        or meta.get("tracked_time_version") != 1
+        or actor.created_at != origin.occurred_at
+    ):
+        raise ValueError("OD-2 actor-time enrollment source contradicts projection")
+    last_at = _utc(origin.occurred_at)
     assigned_work = None
     seen_causes = set()
     for source in source_events:
@@ -421,11 +487,17 @@ def _verify_actor_time_projection(uow, actor: OrganizationalActor) -> None:
                 config_epoch=meta["config_epoch"], work_id=work_id,
                 cost_us=cost,
             )
-            evidence = tuple(event for event in uow.events() if (
-                event.event_id == expected.event_id
-            ))
-            if len(evidence) != 1 or evidence[0] != expected:
-                raise ValueError("OD-2 actor-time work/cost evidence missing or modified")
+        else:
+            expected = _committed_nonwork_cost_event(
+                command=command, actor_id=actor.id, cause_id=cause,
+                source=source, model_spec_hash=meta["model_spec_hash"],
+                config_epoch=meta["config_epoch"], cost_us=cost,
+            )
+        evidence = tuple(event for event in uow.events() if (
+            event.event_id == expected.event_id
+        ))
+        if len(evidence) != 1 or evidence[0] != expected:
+            raise ValueError("OD-2 actor-time original work/nonwork cost evidence missing or modified")
         expected_cause = [
             action, event_at.isoformat(), work_id, cost,
         ]
@@ -548,7 +620,9 @@ def transition_actor(
             # Preserve the stronger original replay-specific identity checks.
             # Before any NEW native transition, refuse to launder mutable
             # actor-time buckets or paid costs as independently reached state.
-            _verify_actor_time_projection(uow, actor)
+            enrolled_time = uow.get_event(_actor_time_origin_event_id(actor_id))
+            if meta.get("tracked_time_version") is not None or enrolled_time is not None:
+                _verify_actor_time_projection(uow, actor)
             prior_at = datetime.fromisoformat(meta["last_at"])
             if now < prior_at:
                 raise ValueError("actor effective time regressed")
@@ -594,6 +668,17 @@ def transition_actor(
                     if uow.get_event(work_evidence.event_id) is not None:
                         raise ValueError("actor work evidence ID already committed")
                     uow.append_event(work_evidence)
+                elif meta.get("tracked_time_version") == 1:
+                    # Paid and zero-cost non-work transitions both require an
+                    # immutable counterpart, preventing cost=0 downgrades.
+                    cost_evidence = _committed_nonwork_cost_event(
+                        command=command, actor_id=actor_id, cause_id=cause_id,
+                        source=emitted[0], model_spec_hash=model_spec_hash,
+                        config_epoch=config_epoch, cost_us=cost_us,
+                    )
+                    if uow.get_event(cost_evidence.event_id) is not None:
+                        raise ValueError("actor cost evidence ID already committed")
+                    uow.append_event(cost_evidence)
                 return actor
             finally:
                 engine.context.drain_events()
