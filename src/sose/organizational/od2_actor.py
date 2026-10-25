@@ -506,7 +506,6 @@ def transition_actor(
             _require_actor_calendar_start(
                 uow, actor, now, require_window=False,
             )
-            _verify_actor_time_projection(uow, actor)
             used = meta["applied_causes"].get(cause_id)
             if used is not None:
                 if used != list(identity):
@@ -546,6 +545,10 @@ def transition_actor(
                             "actor replay lacks immutable work/cost causal evidence"
                         )
                 return actor
+            # Preserve the stronger original replay-specific identity checks.
+            # Before any NEW native transition, refuse to launder mutable
+            # actor-time buckets or paid costs as independently reached state.
+            _verify_actor_time_projection(uow, actor)
             prior_at = datetime.fromisoformat(meta["last_at"])
             if now < prior_at:
                 raise ValueError("actor effective time regressed")
