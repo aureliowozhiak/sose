@@ -105,3 +105,44 @@ def test_isolated_fixture_does_not_launch_docker_for_proxy_cases(monkeypatch, tm
     assert next(fixture) is None
     with pytest.raises(StopIteration):
         next(fixture)
+
+
+@pytest.mark.parametrize("inspect_failure", ("timeout", "error"))
+def test_cleanup_always_attempts_removal_when_docker_inspect_fails(
+    monkeypatch, tmp_path: Path, inspect_failure: str,
+):
+    seen = []
+
+    def fake_docker(*args: str, timeout: int = 30):
+        seen.append(args)
+        if args[0] == "inspect":
+            if inspect_failure == "timeout":
+                raise subprocess.TimeoutExpired(args, timeout)
+            return _result(*args, code=1, err="Docker engine disconnected")
+        if args[:2] == ("rm", "-f"):
+            return _result(*args, out="removed")
+        return _result(*args, out="diagnostic")
+
+    monkeypatch.setattr(pg_chaos, "_docker", fake_docker)
+    pg_chaos._remove_isolated_postgres("sose-pg-chaos-dangling", tmp_path, provisioned=True)
+    assert ("rm", "-f", "sose-pg-chaos-dangling") in seen
+    assert (tmp_path / "docker-logs.txt").exists()
+
+
+def test_inspect_timeout_and_failed_removal_must_fail_closed(monkeypatch, tmp_path: Path):
+    seen = []
+
+    def fake_docker(*args: str, timeout: int = 30):
+        seen.append(args)
+        if args[0] == "inspect":
+            raise subprocess.TimeoutExpired(args, timeout)
+        if args[:2] == ("rm", "-f"):
+            return _result(*args, code=1, err="cannot contact Docker daemon")
+        return _result(*args, out="diagnostic")
+
+    monkeypatch.setattr(pg_chaos, "_docker", fake_docker)
+    with pytest.raises(pytest.fail.Exception, match="container removal failed"):
+        pg_chaos._remove_isolated_postgres(
+            "sose-pg-chaos-dangling", tmp_path, provisioned=False,
+        )
+    assert ("rm", "-f", "sose-pg-chaos-dangling") in seen
