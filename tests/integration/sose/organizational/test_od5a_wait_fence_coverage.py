@@ -5,7 +5,6 @@ evidence of a PostgreSQL booking or a successfully completed historical run.
 """
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
