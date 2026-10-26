@@ -235,10 +235,18 @@ def test_completed_resource_release_checkpoint_can_reconstruct_exact_grants_with
     assert store.events() == before_events
 
 
-def test_arrival_and_forklift_replay_after_docking_and_handling_is_event_idempotent():
+def test_revisiting_handling_or_completed_steps_never_reissues_business_events():
     store, entities, engine = _world()
     _handling(store, entities, engine)
     before = store.events()
-    assert wm.arrive_truck(store, engine, entities=entities) is True
+    # The only physical dock is already occupied by THIS shipment. Arrival
+    # reports no *new* admission; it cannot double-reserve a second dock.
+    assert wm.arrive_truck(store, engine, entities=entities) is False
     assert wm.assign_forklift(store, engine, entities=entities) is True
     assert store.events() == before
+
+    assert wm.complete_unload(store, engine, entities=entities) is True
+    completed_events = store.events()
+    assert wm.arrive_truck(store, engine, entities=entities) is True
+    assert wm.assign_forklift(store, engine, entities=entities) is False
+    assert store.events() == completed_events
