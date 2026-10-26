@@ -6,8 +6,6 @@ the core positive flow. PostgreSQL concurrency/fencing remains a separate gate.
 """
 from __future__ import annotations
 
-from datetime import timedelta
-
 import pytest
 
 from sose.examples.warehouse_management import simulation as wm
