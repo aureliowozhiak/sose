@@ -285,6 +285,7 @@ def _canonical_infrastructure_controls():
 @pytest.mark.parametrize("phase", ("before_commit", "after_commit"))
 def test_real_pc6_atomic_ack_infrastructure_failure_preserves_full_canonical_truth(
     tmp_path, phase, transport, _canonical_infrastructure_controls,
+    isolated_postgres_service,
 ):
     if transport == "server" and not CONTAINER_ID:
         pytest.skip("real PostgreSQL container control is mandatory for server restart")
