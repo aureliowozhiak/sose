@@ -33,7 +33,8 @@ from tests.support.chaos_waits import wait_for_marker_exists, wait_for_process_e
 
 DSN = os.environ.get("SOSE_TEST_POSTGRES_DSN")
 CONTAINER_ID = os.environ.get("SOSE_POSTGRES_CONTAINER_ID")
-pytestmark = pytest.mark.skipif(not DSN, reason="PostgreSQL required")
+# Proxy cases require the shared DSN; real server cases provision their own
+# PostgreSQL through isolated_postgres_service even if no shared DSN exists.
 
 _ACK_WORKER = """
 import os, sys, time
@@ -287,8 +288,12 @@ def test_real_pc6_atomic_ack_infrastructure_failure_preserves_full_canonical_tru
     tmp_path, phase, transport, _canonical_infrastructure_controls,
     isolated_postgres_service,
 ):
-    if transport == "server" and not CONTAINER_ID:
-        pytest.skip("real PostgreSQL container control is mandatory for server restart")
+    if transport == "proxy" and not DSN:
+        pytest.skip("shared PostgreSQL DSN required for proxy transport")
+    if transport == "server":
+        assert DSN and CONTAINER_ID, (
+            "isolated real PostgreSQL is mandatory for physical restart"
+        )
     if phase not in _canonical_infrastructure_controls:
         _canonical_infrastructure_controls[phase] = _uninterrupted_reference(phase)
     baseline = _canonical_infrastructure_controls[phase]
