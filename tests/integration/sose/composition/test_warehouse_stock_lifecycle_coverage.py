@@ -59,6 +59,24 @@ def _receipt(store, entities, engine, **changes):
     return wm.receive_external_replenishment(store, engine, **args)
 
 
+def _assert_one_stock_event(
+    store, entities, *, name, reference_field, reference, quantity,
+):
+    """Exactly one immutable business event must exist before any replay."""
+    events = tuple(
+        event for event in store.events()
+        if event.name == name
+    )
+    assert len(events) == 1, f"expected one {name} publication, got {len(events)}"
+    event = events[0]
+    assert event.entity_type == "warehouse_management_stock"
+    assert event.entity_id == entities.origin_stock_id
+    assert event.payload[reference_field] == reference
+    assert event.payload["sku"] == SKU
+    assert event.payload["quantity"] == quantity
+    return event
+
+
 @pytest.mark.parametrize(
     "bad,match",
     [
@@ -102,13 +120,20 @@ def test_replenishment_replay_is_exactly_once_and_conflicting_quantity_is_reject
     store, entities, engine = _world()
     assert _receipt(store, entities, engine) is True
     assert _stock(store, entities).attributes["on_hand"] == 24.0
-    event_count = len(tuple(store.events()))
+    first_event = _assert_one_stock_event(
+        store, entities,
+        name="warehouse_management.replenishment_received",
+        reference_field="receipt_reference",
+        reference="receipt:immutable", quantity=4.0,
+    )
+    events_before = tuple(store.events())
+    assert first_event in events_before
     assert _receipt(store, entities, engine) is False
-    assert len(tuple(store.events())) == event_count
+    assert tuple(store.events()) == events_before
     with pytest.raises(ValueError, match="receipt replay conflict"):
         _receipt(store, entities, engine, quantity=4.5)
     assert _stock(store, entities).attributes["on_hand"] == 24.0
-    assert len(tuple(store.events())) == event_count
+    assert tuple(store.events()) == events_before
 
 
 @pytest.mark.parametrize(
@@ -155,12 +180,20 @@ def test_durable_reservation_is_idempotent_and_cannot_rebind_quantity_or_sku():
         "consumed": False,
         "consumption_reference": None,
     }
+    first_event = _assert_one_stock_event(
+        store, entities,
+        name="warehouse_management.inventory_reserved",
+        reference_field="reservation_reference",
+        reference="reservation:immutable", quantity=5.0,
+    )
     events_before = tuple(store.events())
+    assert first_event in events_before
     assert _reserve(store, entities, engine) is False
     assert tuple(store.events()) == events_before
     with pytest.raises(ValueError, match="reservation replay conflict"):
         _reserve(store, entities, engine, quantity=4.0)
     assert _stock(store, entities).attributes["reserved"] == 5.0
+    assert tuple(store.events()) == events_before
 
 
 @pytest.mark.parametrize(
@@ -198,7 +231,15 @@ def test_consumption_is_exactly_once_and_refuses_conflicting_receipt_identity():
     record = stock.attributes["external_reservations"]["reservation:immutable"]
     assert record["consumed"] is True
     assert record["consumption_reference"] == "consumption:immutable"
+    first_event = _assert_one_stock_event(
+        store, entities,
+        name="warehouse_management.inventory_consumed",
+        reference_field="consumption_reference",
+        reference="consumption:immutable", quantity=5.0,
+    )
+    assert first_event.payload["reservation_reference"] == "reservation:immutable"
     events_before = tuple(store.events())
+    assert first_event in events_before
     assert _consume(store, entities, engine) is False
     with pytest.raises(ValueError, match="consumption replay conflict"):
         _consume(store, entities, engine, consumption_reference="consumption:forged")
@@ -300,11 +341,16 @@ def test_transfer_lifecycle_kpis_are_derived_from_durable_actual_times():
     assert initial["lead_time_seconds"] is None
     assert initial["lateness_seconds"] is None
     assert wm.start_transfer(store, engine, entities=entities) is True
+    # Arrival occurs after 2h, and unloading finishes at 5h: the
+    # planned deadline is ORIGIN+4h. Constant-zero and premature-departure
+    # KPI implementations must fail both independent numeric assertions.
+    engine.context.clock.advance(2)
     assert wm.arrive_truck(store, engine, entities=entities) is True
     assert wm.assign_forklift(store, engine, entities=entities) is True
+    engine.context.clock.advance(3)
     assert wm.complete_unload(store, engine, entities=entities) is True
     final = wm.shipment_kpis(store, entities=entities)
     assert final["completed"] is True
-    assert final["lead_time_seconds"] == 0.0
-    assert final["lateness_seconds"] == 0.0
-    assert final["on_time"] is True
+    assert final["lead_time_seconds"] == 5 * 3600.0
+    assert final["lateness_seconds"] == 1 * 3600.0
+    assert final["on_time"] is False
