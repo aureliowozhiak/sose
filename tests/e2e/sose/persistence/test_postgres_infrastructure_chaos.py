@@ -248,6 +248,7 @@ def test_whole_postgres_outage_and_restart_recovers_control_state(
     name,
     phase,
     _control_cache,
+    isolated_postgres_service,
 ):
     if not DSN:
         pytest.skip("SOSE_TEST_POSTGRES_DSN is required")
