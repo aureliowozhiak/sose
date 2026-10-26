@@ -7,8 +7,6 @@ port so the original DSN keeps referring to the same instance after restart.
 """
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
 import socket
 import subprocess
@@ -114,6 +112,16 @@ def isolated_postgres_service(request, monkeypatch, tmp_path):
         monkeypatch.setenv("SOSE_TEST_POSTGRES_DSN", dsn)
         monkeypatch.setenv("SOSE_POSTGRES_CONTAINER_ID", container_id)
         yield
+        # A passing physical recovery must restore its original TCP identity
+        # and a real SQL connection, not merely report a restarted process.
+        published_after = _docker("port", container_id, "5432/tcp").stdout.strip()
+        if published_after != f"127.0.0.1:{port}":
+            pytest.fail(
+                f"PostgreSQL host port changed after physical restart: "
+                f"{published_after!r}; original was {port}"
+            )
+        with psycopg.connect(dsn, connect_timeout=3) as connection:
+            assert connection.execute("SELECT 1").fetchone() == (1,)
     finally:
         _capture_postgres_evidence(container_id, diagnostics)
         _docker("rm", "-f", container_id, timeout=45)
