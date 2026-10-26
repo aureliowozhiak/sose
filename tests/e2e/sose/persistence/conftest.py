@@ -1,9 +1,8 @@
 """Dedicated real PostgreSQL per destructive postmaster test (#598).
 
-The shared pytest_auto_postgres database must never be stopped by a fault test:
-an unready postmaster otherwise poisons unrelated conformance nodes. A true
-Docker stop/start still occurs inside the caller's test, using a fixed host
-port so the original DSN keeps referring to the same instance after restart.
+A shared PostgreSQL instance must never be stopped by real fault injection.
+Each destructive test receives its own fixed-port container and fails closed
+if provisioning, recovery verification or teardown is unsuccessful.
 """
 from __future__ import annotations
 
@@ -33,60 +32,94 @@ def _fixed_host_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _capture_postgres_evidence(container_id: str, directory: Path) -> None:
+def _capture_postgres_evidence(name: str, directory: Path) -> None:
+    """Capture a bounded forensic record before removing the dedicated DB."""
     directory.mkdir(parents=True, exist_ok=True)
-    for name, args in (
-        ("docker-logs.txt", ("logs", "--timestamps", "--tail", "200", container_id)),
-        ("docker-inspect.json", ("inspect", container_id)),
-        ("docker-port.txt", ("port", container_id, "5432/tcp")),
+    for filename, args in (
+        ("docker-logs.txt", ("logs", "--timestamps", "--tail", "200", name)),
+        ("docker-inspect.json", ("inspect", name)),
+        ("docker-port.txt", ("port", name, "5432/tcp")),
     ):
         try:
             result = _docker(*args, timeout=15)
-            (directory / name).write_text(
+            (directory / filename).write_text(
                 result.stdout + result.stderr, encoding="utf-8",
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            (directory / name).write_text(
+            (directory / filename).write_text(
                 f"Failed to obtain Docker diagnostic: {exc}", encoding="utf-8",
             )
 
 
+def _remove_isolated_postgres(name: str, directory: Path, *, provisioned: bool) -> None:
+    """Find/remove by assigned name even if 'docker run' timed out before ID reply."""
+    _capture_postgres_evidence(name, directory)
+    try:
+        inspected = _docker("inspect", name, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        pytest.fail(f"cannot inspect isolated PostgreSQL for cleanup: {exc}")
+    if inspected.returncode != 0:
+        if provisioned or "No such object" not in inspected.stderr:
+            pytest.fail(
+                "cannot prove isolated PostgreSQL was cleaned up: "
+                + inspected.stderr[-1500:]
+            )
+        # Container was never created; preserve the original provisioning error.
+        return
+
+    try:
+        removed = _docker("rm", "-f", name, timeout=45)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        pytest.fail(f"cannot remove isolated PostgreSQL {name}: {exc}")
+    if removed.returncode != 0:
+        pytest.fail(
+            f"isolated PostgreSQL container removal failed ({name}): "
+            + removed.stderr[-1500:]
+        )
+
+
 @pytest.fixture
 def isolated_postgres_service(request, monkeypatch, tmp_path):
-    """Only real postmaster-death variants receive an independent database.
+    """Physically destructive variants only; proxy cases keep the shared DB.
 
-    Tests exercising a proxy-only disruption keep their standard shared DSN.
-    Import-time DSN/CONTAINER_ID globals on the specifically requesting module
-    are patched, and child process environment is patched for the test lifetime.
+    Use one real fixed-port Docker PostgreSQL per test. All callers' DSN globals
+    and subprocess environments are temporarily patched only for this testcase.
     """
     parameters = getattr(getattr(request.node, "callspec", None), "params", {})
     if parameters.get("transport") == "proxy":
         yield
         return
 
-    # A chosen fixed binding survives docker stop/start. Never use
-    # '-p 127.0.0.1::5432': Docker can rebind a new port upon restart.
     port = _fixed_host_port()
     name = f"sose-pg-chaos-{uuid4().hex[:16]}"
-    run = _docker(
-        "run", "-d", "--name", name,
-        "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
-        "-e", "POSTGRES_DB=postgres",
-        "-p", f"127.0.0.1:{port}:5432",
-        "postgres:16-alpine", timeout=45,
-    )
-    if run.returncode != 0:
-        pytest.fail(
-            "real isolated PostgreSQL container provisioning failed: "
-            + run.stderr[-1500:]
-        )
-    container_id = run.stdout.strip()
-    if not container_id:
-        pytest.fail("docker run returned no PostgreSQL container identifier")
-    diagnostics = tmp_path / "isolated-postgres"
     dsn = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+    diagnostics = tmp_path / "isolated-postgres"
+    provisioned = False
 
+    # This try/finally includes docker run itself. Even a timeout or lost
+    # container-ID reply must trigger discovery and cleanup by known name.
     try:
+        try:
+            run = _docker(
+                "run", "-d", "--name", name,
+                "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
+                "-e", "POSTGRES_DB=postgres",
+                "-p", f"127.0.0.1:{port}:5432",
+                "postgres:16-alpine", timeout=45,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            pytest.fail(f"isolated PostgreSQL provisioning command failed: {exc}")
+
+        if run.returncode != 0:
+            pytest.fail(
+                "real isolated PostgreSQL container provisioning failed: "
+                + run.stderr[-1500:]
+            )
+        container_id = run.stdout.strip()
+        if not container_id:
+            pytest.fail("docker run returned no PostgreSQL container identifier")
+        provisioned = True
+
         deadline = time.monotonic() + 120.0
         last_error: Exception | None = None
         while time.monotonic() < deadline:
@@ -100,7 +133,7 @@ def isolated_postgres_service(request, monkeypatch, tmp_path):
         else:
             pytest.fail(f"isolated PostgreSQL never became ready: {last_error}")
 
-        published = _docker("port", container_id, "5432/tcp").stdout.strip()
+        published = _docker("port", name, "5432/tcp").stdout.strip()
         if published != f"127.0.0.1:{port}":
             pytest.fail(
                 f"isolated PostgreSQL must preserve fixed host port: {published}"
@@ -112,16 +145,16 @@ def isolated_postgres_service(request, monkeypatch, tmp_path):
         monkeypatch.setenv("SOSE_TEST_POSTGRES_DSN", dsn)
         monkeypatch.setenv("SOSE_POSTGRES_CONTAINER_ID", container_id)
         yield
-        # A passing physical recovery must restore its original TCP identity
-        # and a real SQL connection, not merely report a restarted process.
-        published_after = _docker("port", container_id, "5432/tcp").stdout.strip()
-        if published_after != f"127.0.0.1:{port}":
+
+        # A passing physical recovery must restore the same host TCP endpoint
+        # and a real SQL connection, not merely restart a container process.
+        after = _docker("port", name, "5432/tcp").stdout.strip()
+        if after != f"127.0.0.1:{port}":
             pytest.fail(
                 f"PostgreSQL host port changed after physical restart: "
-                f"{published_after!r}; original was {port}"
+                f"{after!r}; original was {port}"
             )
         with psycopg.connect(dsn, connect_timeout=3) as connection:
             assert connection.execute("SELECT 1").fetchone() == (1,)
     finally:
-        _capture_postgres_evidence(container_id, diagnostics)
-        _docker("rm", "-f", container_id, timeout=45)
+        _remove_isolated_postgres(name, diagnostics, provisioned=provisioned)
