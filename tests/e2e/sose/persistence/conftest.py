@@ -52,29 +52,45 @@ def _capture_postgres_evidence(name: str, directory: Path) -> None:
 
 
 def _remove_isolated_postgres(name: str, directory: Path, *, provisioned: bool) -> None:
-    """Find/remove by assigned name even if 'docker run' timed out before ID reply."""
-    _capture_postgres_evidence(name, directory)
+    """Always attempt named-container removal, including after inspect failure.
+
+    Inspection is best-effort discovery, never a prerequisite for cleanup. A
+    successful docker rm -f is sufficient for a previously unknown container;
+    any failed removal fails the test rather than leaking trust-auth PostgreSQL.
+    """
+    inspect_error = None
+    try:
+        _capture_postgres_evidence(name, directory)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # Diagnostic errors must never prevent the teardown attempt.
+        inspect_error = f"diagnostic capture failed: {exc}"
+
     try:
         inspected = _docker("inspect", name, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        pytest.fail(f"cannot inspect isolated PostgreSQL for cleanup: {exc}")
-    if inspected.returncode != 0:
-        if provisioned or "No such object" not in inspected.stderr:
-            pytest.fail(
-                "cannot prove isolated PostgreSQL was cleaned up: "
-                + inspected.stderr[-1500:]
+        inspect_error = f"container inspection failed: {exc}"
+    else:
+        if inspected.returncode != 0:
+            if "No such object" in inspected.stderr and not provisioned:
+                return
+            inspect_error = (
+                "container inspection returned nonzero: " + inspected.stderr[-1500:]
             )
-        # Container was never created; preserve the original provisioning error.
-        return
 
+    # Crucial: even when inspect timed out or failed, use the known unique
+    # container name to remove any object docker run might have left behind.
     try:
         removed = _docker("rm", "-f", name, timeout=45)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        pytest.fail(f"cannot remove isolated PostgreSQL {name}: {exc}")
+        pytest.fail(
+            f"cannot remove isolated PostgreSQL {name}: {exc}; "
+            f"inspection: {inspect_error}"
+        )
     if removed.returncode != 0:
         pytest.fail(
             f"isolated PostgreSQL container removal failed ({name}): "
             + removed.stderr[-1500:]
+            + (f"; inspection: {inspect_error}" if inspect_error else "")
         )
 
 
