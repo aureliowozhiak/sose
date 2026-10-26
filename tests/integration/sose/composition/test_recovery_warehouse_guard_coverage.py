@@ -217,7 +217,7 @@ def test_composed_allocation_refuses_local_inventory_ownership_mutation():
     [
         {"stock_reference": "wm:stock:foreign"},
         {"reservation_reference": "wm:reservation:foreign"},
-        {"quantity": 10.0000001},
+        {"quantity": 10.0000000001},
     ],
 )
 def test_composed_allocation_replay_cannot_rebind_original_warehouse_certificate(changed):
