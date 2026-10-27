@@ -6,6 +6,7 @@ database. The separate e2e tests certify genuine postmaster stop/start.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -225,5 +226,5 @@ def test_service_restart_refreshes_docker_reassigned_host_port(monkeypatch):
     assert dsn == "postgresql://postgres@127.0.0.1:60083/postgres"
     assert service.port == 60083
     assert module.DSN == dsn
-    assert __import__("os").environ["SOSE_TEST_POSTGRES_DSN"] == dsn
+    assert os.environ["SOSE_TEST_POSTGRES_DSN"] == dsn
     assert ("start", "container-id") in seen
