@@ -1,9 +1,10 @@
 """Dedicated real PostgreSQL per destructive postmaster test (#598).
 
 A shared PostgreSQL instance must never be stopped by real fault injection.
-Each destructive test receives its own Docker container with a stable published
-host port and fails closed if provisioning, recovery verification or teardown
-is unsuccessful.
+Each destructive test receives its own Docker container and fails closed if
+provisioning, recovery verification or teardown is unsuccessful. Docker may
+reassign a dynamically published host port on container restart, so the
+endpoint is resolved again before post-restart SQL work.
 """
 from __future__ import annotations
 
@@ -113,13 +114,64 @@ def _remove_isolated_postgres(name: str, directory: Path, *, provisioned: bool) 
         )
 
 
+class _IsolatedPostgresService:
+    """Dedicated PostgreSQL container whose dynamic endpoint may change on restart."""
+
+    def __init__(self, *, name, container_id, port, module, monkeypatch):
+        self.name = name
+        self.container_id = container_id
+        self.port = port
+        self.dsn = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+        self.module = module
+        self.monkeypatch = monkeypatch
+
+    def _set_endpoint(self, port: int) -> None:
+        self.port = port
+        self.dsn = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+        self.monkeypatch.setattr(self.module, "DSN", self.dsn)
+        self.monkeypatch.setenv("SOSE_TEST_POSTGRES_DSN", self.dsn)
+
+    def restart(self) -> str:
+        """Restart the same container, resolve its current host port, and await SQL."""
+        try:
+            started = _docker("start", self.container_id, timeout=45)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            pytest.fail(f"isolated PostgreSQL restart command failed: {exc}")
+        if started.returncode != 0:
+            pytest.fail(
+                "isolated PostgreSQL container restart failed: "
+                + started.stderr[-1500:]
+            )
+
+        deadline = time.monotonic() + 120.0
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            port = _published_host_port(self.name)
+            dsn = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+            try:
+                with psycopg.connect(dsn, connect_timeout=2) as connection:
+                    assert connection.execute("SELECT 1").fetchone() == (1,)
+            except (psycopg.Error, AssertionError) as error:
+                last_error = error
+                time.sleep(0.25)
+                continue
+            self._set_endpoint(port)
+            return self.dsn
+
+        pytest.fail(
+            "isolated PostgreSQL did not become SQL-ready after restart: "
+            f"{last_error}"
+        )
+
+
 @pytest.fixture
 def isolated_postgres_service(request, monkeypatch, tmp_path):
     """Physically destructive variants only; proxy cases keep the shared DB.
 
     Docker allocates the loopback host port atomically, avoiding the race in
-    bind(127.0.0.1, 0) -> close -> docker run -p <port>. The published port is
-    then read from Docker and must remain stable across postmaster restarts.
+    bind(127.0.0.1, 0) -> close -> docker run -p <port>. Because Docker may
+    reassign that dynamic port on restart, consumers must call service.restart()
+    before post-restart SQL work; it refreshes the module DSN after SQL readiness.
     """
     parameters = getattr(getattr(request.node, "callspec", None), "params", {})
     if parameters.get("transport") == "proxy":
@@ -176,21 +228,28 @@ def isolated_postgres_service(request, monkeypatch, tmp_path):
             )
 
         module = request.module
+        service = _IsolatedPostgresService(
+            name=name,
+            container_id=container_id,
+            port=port,
+            module=module,
+            monkeypatch=monkeypatch,
+        )
         monkeypatch.setattr(module, "DSN", dsn)
         monkeypatch.setattr(module, "CONTAINER_ID", container_id)
         monkeypatch.setenv("SOSE_TEST_POSTGRES_DSN", dsn)
         monkeypatch.setenv("SOSE_POSTGRES_CONTAINER_ID", container_id)
-        yield
+        yield service
 
-        # A passing physical recovery must restore the same host TCP endpoint
-        # and a real SQL connection, not merely restart a container process.
+        # Require the endpoint to match the latest Docker mapping. It may differ
+        # from the initial port, but a successful restart must refresh the DSN.
         after = _published_host_port(name)
-        if after != port:
+        if after != service.port:
             pytest.fail(
-                f"PostgreSQL host port changed after physical restart: "
-                f"{after!r}; original was {port}"
+                f"PostgreSQL host port changed without endpoint refresh: "
+                f"{after!r}; expected {service.port}"
             )
-        with psycopg.connect(dsn, connect_timeout=3) as connection:
+        with psycopg.connect(service.dsn, connect_timeout=3) as connection:
             assert connection.execute("SELECT 1").fetchone() == (1,)
     finally:
         _remove_isolated_postgres(name, diagnostics, provisioned=provisioned)
