@@ -18,6 +18,42 @@ def _result(*args, code=0, out="", err=""):
     return subprocess.CompletedProcess(args, code, stdout=out, stderr=err)
 
 
+def test_published_host_port_accepts_docker_assigned_loopback_mapping(monkeypatch):
+    monkeypatch.setattr(
+        pg_chaos, "_docker",
+        lambda *args, timeout=30: _result(*args, out="127.0.0.1:55439\n"),
+    )
+    assert pg_chaos._published_host_port("sose-pg-chaos-test") == 55439
+
+
+@pytest.mark.parametrize(
+    "output",
+    (
+        "0.0.0.0:55439",
+        "127.0.0.1:not-a-port",
+        "127.0.0.1:0",
+        "127.0.0.1:65536",
+        "127.0.0.1:55439\n127.0.0.1:55440",
+    ),
+)
+def test_published_host_port_rejects_invalid_or_ambiguous_mapping(monkeypatch, output):
+    monkeypatch.setattr(
+        pg_chaos, "_docker",
+        lambda *args, timeout=30: _result(*args, out=output),
+    )
+    with pytest.raises(pytest.fail.Exception):
+        pg_chaos._published_host_port("sose-pg-chaos-test")
+
+
+def test_published_host_port_fails_when_docker_port_command_fails(monkeypatch):
+    monkeypatch.setattr(
+        pg_chaos, "_docker",
+        lambda *args, timeout=30: _result(*args, code=1, err="daemon unavailable"),
+    )
+    with pytest.raises(pytest.fail.Exception, match="daemon unavailable"):
+        pg_chaos._published_host_port("sose-pg-chaos-test")
+
+
 @pytest.mark.parametrize("fault", ("run_timeout", "empty_id", "run_error"))
 def test_postgres_provisioning_failures_still_clean_up_named_container(
     monkeypatch, tmp_path: Path, fault: str,
@@ -41,7 +77,6 @@ def test_postgres_provisioning_failures_still_clean_up_named_container(
         return _result(*args, out="diagnostic")
 
     monkeypatch.setattr(pg_chaos, "_docker", fake_docker)
-    monkeypatch.setattr(pg_chaos, "_fixed_host_port", lambda: 39111)
     request = SimpleNamespace(
         node=SimpleNamespace(callspec=SimpleNamespace(params={"transport": "server"})),
     )
@@ -56,6 +91,7 @@ def test_postgres_provisioning_failures_still_clean_up_named_container(
     assert len(creations) == 1
     assert len(removals) == 1
     assert creations[0][creations[0].index("--name") + 1] == removals[0][2]
+    assert creations[0][creations[0].index("-p") + 1] == "127.0.0.1::5432"
     assert (tmp_path / "isolated-postgres/docker-inspect.json").is_file()
 
 
