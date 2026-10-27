@@ -182,3 +182,48 @@ def test_inspect_timeout_and_failed_removal_must_fail_closed(monkeypatch, tmp_pa
             "sose-pg-chaos-dangling", tmp_path, provisioned=False,
         )
     assert ("rm", "-f", "sose-pg-chaos-dangling") in seen
+
+
+def test_service_restart_refreshes_docker_reassigned_host_port(monkeypatch):
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, statement):
+            assert statement == "SELECT 1"
+            return self
+
+        def fetchone(self):
+            return (1,)
+
+    seen = []
+
+    def fake_docker(*args, timeout=30):
+        seen.append(args)
+        if args[0] == "start":
+            return _result(*args, out="container-id")
+        if args[0] == "port":
+            return _result(*args, out="127.0.0.1:60083\\n")
+        raise AssertionError(f"unexpected Docker command: {args}")
+
+    monkeypatch.setattr(pg_chaos, "_docker", fake_docker)
+    monkeypatch.setattr(pg_chaos.psycopg, "connect", lambda *args, **kwargs: Connection())
+    module = SimpleNamespace(DSN="postgresql://postgres@127.0.0.1:52431/postgres")
+    service = pg_chaos._IsolatedPostgresService(
+        name="sose-pg-chaos-test",
+        container_id="container-id",
+        port=52431,
+        module=module,
+        monkeypatch=monkeypatch,
+    )
+
+    dsn = service.restart()
+
+    assert dsn == "postgresql://postgres@127.0.0.1:60083/postgres"
+    assert service.port == 60083
+    assert module.DSN == dsn
+    assert __import__("os").environ["SOSE_TEST_POSTGRES_DSN"] == dsn
+    assert ("start", "container-id") in seen
