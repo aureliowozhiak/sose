@@ -207,7 +207,7 @@ def test_service_restart_refreshes_docker_reassigned_host_port(monkeypatch):
         if args[0] == "start":
             return _result(*args, out="container-id")
         if args[0] == "port":
-            return _result(*args, out="127.0.0.1:60083\\n")
+            return _result(*args, out="127.0.0.1:60083\n")
         raise AssertionError(f"unexpected Docker command: {args}")
 
     monkeypatch.setattr(pg_chaos, "_docker", fake_docker)
