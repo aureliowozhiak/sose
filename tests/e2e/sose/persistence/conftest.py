@@ -1,13 +1,13 @@
 """Dedicated real PostgreSQL per destructive postmaster test (#598).
 
 A shared PostgreSQL instance must never be stopped by real fault injection.
-Each destructive test receives its own fixed-port container and fails closed
-if provisioning, recovery verification or teardown is unsuccessful.
+Each destructive test receives its own Docker container with a stable published
+host port and fails closed if provisioning, recovery verification or teardown
+is unsuccessful.
 """
 from __future__ import annotations
 
 from pathlib import Path
-import socket
 import subprocess
 import time
 from uuid import uuid4
@@ -26,10 +26,29 @@ def _docker(*arguments: str, timeout: int = 30) -> subprocess.CompletedProcess[s
     )
 
 
-def _fixed_host_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def _published_host_port(name: str) -> int:
+    """Return Docker's assigned loopback port, failing closed on bad mappings."""
+    result = _docker("port", name, "5432/tcp", timeout=15)
+    if result.returncode != 0:
+        pytest.fail(
+            f"cannot inspect isolated PostgreSQL host port ({name}): "
+            + result.stderr[-1500:]
+        )
+
+    published = result.stdout.strip()
+    host, separator, raw_port = published.rpartition(":")
+    if not separator or host != "127.0.0.1":
+        pytest.fail(
+            "isolated PostgreSQL must publish exactly one loopback endpoint; "
+            f"got {published!r}"
+        )
+    try:
+        port = int(raw_port)
+    except ValueError:
+        pytest.fail(f"invalid isolated PostgreSQL host port: {published!r}")
+    if not 1 <= port <= 65535:
+        pytest.fail(f"invalid isolated PostgreSQL host port: {published!r}")
+    return port
 
 
 def _capture_postgres_evidence(name: str, directory: Path) -> None:
@@ -98,17 +117,16 @@ def _remove_isolated_postgres(name: str, directory: Path, *, provisioned: bool) 
 def isolated_postgres_service(request, monkeypatch, tmp_path):
     """Physically destructive variants only; proxy cases keep the shared DB.
 
-    Use one real fixed-port Docker PostgreSQL per test. All callers' DSN globals
-    and subprocess environments are temporarily patched only for this testcase.
+    Docker allocates the loopback host port atomically, avoiding the race in
+    bind(127.0.0.1, 0) -> close -> docker run -p <port>. The published port is
+    then read from Docker and must remain stable across postmaster restarts.
     """
     parameters = getattr(getattr(request.node, "callspec", None), "params", {})
     if parameters.get("transport") == "proxy":
         yield
         return
 
-    port = _fixed_host_port()
     name = f"sose-pg-chaos-{uuid4().hex[:16]}"
-    dsn = f"postgresql://postgres@127.0.0.1:{port}/postgres"
     diagnostics = tmp_path / "isolated-postgres"
     provisioned = False
 
@@ -120,7 +138,7 @@ def isolated_postgres_service(request, monkeypatch, tmp_path):
                 "run", "-d", "--name", name,
                 "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
                 "-e", "POSTGRES_DB=postgres",
-                "-p", f"127.0.0.1:{port}:5432",
+                "-p", "127.0.0.1::5432",
                 "postgres:16-alpine", timeout=45,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -136,6 +154,9 @@ def isolated_postgres_service(request, monkeypatch, tmp_path):
             pytest.fail("docker run returned no PostgreSQL container identifier")
         provisioned = True
 
+        port = _published_host_port(name)
+        dsn = f"postgresql://postgres@127.0.0.1:{port}/postgres"
+
         deadline = time.monotonic() + 120.0
         last_error: Exception | None = None
         while time.monotonic() < deadline:
@@ -149,10 +170,9 @@ def isolated_postgres_service(request, monkeypatch, tmp_path):
         else:
             pytest.fail(f"isolated PostgreSQL never became ready: {last_error}")
 
-        published = _docker("port", name, "5432/tcp").stdout.strip()
-        if published != f"127.0.0.1:{port}":
+        if _published_host_port(name) != port:
             pytest.fail(
-                f"isolated PostgreSQL must preserve fixed host port: {published}"
+                "isolated PostgreSQL host port changed during readiness check"
             )
 
         module = request.module
@@ -164,8 +184,8 @@ def isolated_postgres_service(request, monkeypatch, tmp_path):
 
         # A passing physical recovery must restore the same host TCP endpoint
         # and a real SQL connection, not merely restart a container process.
-        after = _docker("port", name, "5432/tcp").stdout.strip()
-        if after != f"127.0.0.1:{port}":
+        after = _published_host_port(name)
+        if after != port:
             pytest.fail(
                 f"PostgreSQL host port changed after physical restart: "
                 f"{after!r}; original was {port}"
